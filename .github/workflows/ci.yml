@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite is a built-in from 22.5 onwards, so there is no native
+          # module to compile and no database service to stand up.
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      # The eval suite runs on the scripted provider, so it needs no API key and
+      # costs nothing — which is the point. A guardrail regression fails the
+      # build here rather than in production.
+      - name: Evaluation suite
+        run: npm run eval
