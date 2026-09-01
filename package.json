@@ -1,0 +1,27 @@
+{
+  "name": "ops-copilot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "An agentic on-call assistant that answers operational questions by calling real tools, with engine-enforced guardrails and a scored evaluation harness.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "seed": "tsx src/db/seed.ts",
+    "ask": "tsx src/index.ts",
+    "eval": "tsx evals/run.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.122.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
