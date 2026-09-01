@@ -4,14 +4,15 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { route } from "../src/agent/router.js";
 import { searchRunbooks } from "../src/rag/retrieve.js";
-import { buildDatabase, NOW_MS } from "../src/db/seed.js";
+import { NOW_MS } from "../src/db/seed.js";
+import { freshDb } from "./fixture.js";
 
 const DB = join(process.cwd(), "data", "test-router.db");
 const NOW = new Date(NOW_MS).toISOString();
 let db: DatabaseSyncInstance;
 
 beforeAll(() => {
-  buildDatabase(DB);
+  freshDb(DB);
   db = new DatabaseSync(DB, { readOnly: true });
 });
 afterAll(() => {

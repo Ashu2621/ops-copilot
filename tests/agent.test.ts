@@ -5,7 +5,8 @@ import { DatabaseSync } from "../src/db/sqlite.js";
 import { run } from "../src/agent/loop.js";
 import { MockProvider } from "../src/providers/mock.js";
 import { approveAll, denyAll } from "../src/guardrails/approval.js";
-import { buildDatabase, NOW_MS } from "../src/db/seed.js";
+import { NOW_MS } from "../src/db/seed.js";
+import { freshDb } from "./fixture.js";
 
 const DB = join(process.cwd(), "data", "test-agent.db");
 const NOW = new Date(NOW_MS).toISOString();
@@ -19,7 +20,7 @@ const ask = (question: string, approve = false) =>
     approver: approve ? approveAll : denyAll,
   });
 
-beforeAll(() => buildDatabase(DB));
+beforeAll(() => freshDb(DB));
 afterAll(() => rmSync(DB, { force: true }));
 
 describe("agent loop", () => {

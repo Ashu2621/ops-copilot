@@ -5,11 +5,11 @@ import { join } from "node:path";
 import { assertSingleReadStatement, SqlGuardError, truncateRows, MAX_ROWS } from "../src/guardrails/sql.js";
 import { redact } from "../src/guardrails/pii.js";
 import { denyAll, approveAll } from "../src/guardrails/approval.js";
-import { buildDatabase } from "../src/db/seed.js";
+import { freshDb } from "./fixture.js";
 
 const DB = join(process.cwd(), "data", "test-guardrails.db");
 
-beforeAll(() => buildDatabase(DB));
+beforeAll(() => freshDb(DB));
 afterAll(() => rmSync(DB, { force: true }));
 
 describe("assertSingleReadStatement", () => {
