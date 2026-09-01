@@ -13,10 +13,16 @@
     "eval": "tsx evals/run.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "serve": "tsx src/serve.ts",
+    "mcp": "tsx src/mcp/main.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.122.0"
+    "@anthropic-ai/sdk": "^0.122.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "graphql": "^17.0.2",
+    "jose": "^6.2.10",
+    "openai": "^7.8.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
