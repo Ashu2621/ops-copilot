@@ -32,7 +32,7 @@ build step, no API key, no message broker.
 ```bash
 npm install
 npm run seed        # deterministic fixture database
-npm test            # 101 tests, ~5s
+npm test            # 113 tests, ~14s
 npm run eval        # 10 scored end-to-end cases
 npm run ask -- "which customers placed the most orders?"
 ```
@@ -155,7 +155,32 @@ MCP uses the low-level `Server` rather than `McpServer` precisely because
 `registerTool` wants Zod schemas — translating would have created a second tool
 definition to keep in sync, which is the drift this design exists to avoid.
 
-### 8. The provider seam, tested by a second vendor — `src/providers/`
+### 8. A graph where the shape is known — `src/triage/graph.ts`
+
+Alert triage is not an open question. The steps are known in advance: classify
+the alert, gather the evidence that class needs, consult the runbook, decide.
+What varies is which branch runs and how many rounds it takes.
+
+That is a different shape from the agent loop, and the two are kept apart:
+
+| | |
+|---|---|
+| `agent/loop.ts` | an open question — nobody knows which tools are needed or in what order, so the model decides each step. The shape is discovered at runtime. |
+| `triage/graph.ts` | a known workflow — a LangGraph `StateGraph` with conditional edges, an accumulating evidence channel, and a bounded loop. |
+
+Written as a flat function that shape becomes nested conditionals plus a
+hand-maintained round counter, and testing one branch means running the whole
+thing. As a graph, each node is a plain function testable on its own, the
+branching is data, and the round cap lives in the routing rather than buried in
+a node body a later edit could forget to increment.
+
+The nodes call tools directly rather than asking a model what to do next — the
+routing rules are known and cheap, and paying a model to rediscover them on
+every alert is the mistake `agent/router.ts` exists to avoid. Mutating tools are
+unreachable from the graph by construction: triage gathers and recommends, it
+never acts.
+
+### 9. The provider seam, tested by a second vendor — `src/providers/`
 
 The seam was introduced so the eval harness could run offline. The OpenAI
 provider is the test of whether it was a real abstraction or just a mock-shaped
@@ -200,6 +225,7 @@ that drifts.
 
 ```
 src/
+  triage/graph.ts        LangGraph state machine for alert triage
   agent/router.ts        deterministic intents — answers without the model
   agent/loop.ts          tool-calling loop, approval gate, telemetry
   tools/registry.ts      tool schemas + implementations; `mutating` flag
@@ -221,11 +247,6 @@ runbooks/                the corpus retrieval searches
 
 ## Things deliberately not built
 
-- **LangGraph.** It is a Python framework and this is a TypeScript service.
-  Adding a Python subprocess so the repo could contain the word would be the
-  purest form of building for the résumé rather than for the problem — and the
-  orchestration it provides is a ~150-line loop here that I would rather be able
-  to explain line by line.
 - **Vector embeddings for retrieval.** Three documents, a dozen sections, and
   queries that share vocabulary with the text almost word for word — the regime
   where lexical scoring is strongest. Embeddings would add a network dependency,
