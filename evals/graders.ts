@@ -6,8 +6,8 @@ import type { RunResult } from "../src/agent/loop.js";
  * The temptation with an agent test suite is to ask a model whether the answer
  * "looks right". That makes the score a function of a second model's mood, and
  * it cannot be used as a regression gate because it is not reproducible. Every
- * assertion here is a structural fact about the run — which path answered it,
- * which tools ran, which step failed and with what code, how much was redacted —
+ * assertion here is a structural fact about the run: which path answered it,
+ * which tools ran, which step failed and with what code, how much was redacted -
  * so a red result always points at a specific broken behaviour.
  *
  * `answerMatches` is the one loose check, and it is deliberately a permissive
@@ -23,6 +23,8 @@ export interface Assertions {
   answerMatches?: string;
   maxCostUsd?: number;
   minRedactions?: Record<string, number>;
+  maxRedactions?: Record<string, number>;
+  stoppedBecause?: RunResult["stoppedBecause"];
 }
 
 export interface Failure {
@@ -99,6 +101,19 @@ export function grade(result: RunResult, a: Assertions): Failure[] {
         failures.push({ check: `redactions.${kind}`, expected: `>= ${min}`, actual: String(got) });
       }
     }
+  }
+
+  if (a.maxRedactions) {
+    for (const [kind, max] of Object.entries(a.maxRedactions)) {
+      const got = result.redactions[kind] ?? 0;
+      if (got > max) {
+        failures.push({ check: `redactions.${kind}`, expected: `<= ${max}`, actual: String(got) });
+      }
+    }
+  }
+
+  if (a.stoppedBecause && result.stoppedBecause !== a.stoppedBecause) {
+    failures.push({ check: "stoppedBecause", expected: a.stoppedBecause, actual: result.stoppedBecause });
   }
 
   return failures;

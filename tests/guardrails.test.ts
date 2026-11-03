@@ -116,16 +116,15 @@ describe("PII redaction", () => {
 });
 
 describe("approval gate", () => {
-  const request = { tool: "issue_refund", input: {}, summary: "Refund $25.00 on order #12" };
+  const request = { runId: "r1", tool: "issue_refund", input: {}, summary: "Refund $25.00 on order #12" };
 
-  it("denies by default when no human is attached", async () => {
+  it("denies by default when nobody is attached", async () => {
     const decision = await denyAll(request);
-    expect(decision.approved).toBe(false);
+    expect(decision.status).toBe("denied");
   });
 
   it("records who approved, for the audit trail", async () => {
     const decision = await approveAll(request);
-    expect(decision.approved).toBe(true);
-    expect(decision.decidedBy).toBe("eval-harness");
+    expect(decision).toEqual({ status: "approved", decidedBy: "eval-harness" });
   });
 });

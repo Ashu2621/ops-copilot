@@ -1,23 +1,34 @@
-/**
- * Single entry point for Node's built-in SQLite.
- *
- * Why the indirection: `node:sqlite` is newer than the builtin list baked into
- * the Vite version Vitest runs on, so a direct `import ... from "node:sqlite"`
- * gets picked up by the transform pipeline, which strips the `node:` prefix and
- * then fails to find a package called `sqlite` on disk. Loading it through
- * `createRequire` keeps the specifier out of the static import graph, so it
- * reaches Node untouched.
- *
- * The type import on the last line is erased at compile time, so it costs
- * nothing at runtime while keeping full type safety at the call sites.
- *
- * Delete this file and import `node:sqlite` directly once the toolchain
- * recognises it.
- */
+// node:sqlite is loaded through createRequire because the Vite version under
+// Vitest doesn't know it as a builtin yet and strips the `node:` prefix.
+// Import it directly once the toolchain catches up.
 import { createRequire } from "node:module";
+import type { DatabaseSync as DatabaseSyncInstance } from "node:sqlite";
 
 const nodeRequire = createRequire(import.meta.url);
 const sqlite = nodeRequire("node:sqlite") as typeof import("node:sqlite");
 
 export const { DatabaseSync } = sqlite;
-export type { DatabaseSync as DatabaseSyncInstance } from "node:sqlite";
+export type { DatabaseSyncInstance };
+
+/** Opens a read-write handle that waits on a locked file instead of failing. */
+export function openWritable(path: string): DatabaseSyncInstance {
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA busy_timeout = 5000");
+  return db;
+}
+
+/**
+ * Runs `fn` inside BEGIN IMMEDIATE. IMMEDIATE takes the write lock up front,
+ * so a read-check-write sequence can't interleave with another writer.
+ */
+export function immediate<T>(db: DatabaseSyncInstance, fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const out = fn();
+    db.exec("COMMIT");
+    return out;
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}

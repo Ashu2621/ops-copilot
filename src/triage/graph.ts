@@ -1,35 +1,15 @@
 /**
- * Alert triage as an explicit state graph.
+ * Alert triage as a LangGraph state machine.
  *
- * DESIGN NOTE — why this is not the agent loop, and why the agent loop stays.
- *
- * The two solve different shapes of problem, and using either for the other's
- * job is the mistake worth avoiding:
- *
- *   agent/loop.ts   an open question. Nobody knows in advance which tools are
- *                   needed or in what order, so the model decides each step.
- *                   The shape is discovered at runtime.
- *
- *   this file       alert triage. The shape IS known in advance — classify the
- *                   alert, gather the evidence that class needs, consult the
- *                   runbook, decide. What varies is which branch runs and how
- *                   many rounds it takes, not what the steps are.
- *
- * Written as a flat function, that shape becomes nested conditionals plus a
- * hand-maintained round counter, and testing one branch means running the whole
- * thing. As a graph it is a declared set of nodes and edges: each node is a
- * plain function that can be tested on its own, the branching is data, and the
- * recursion bound is enforced by the runtime rather than by a counter I have to
- * remember to increment.
- *
- * The nodes call tools directly rather than asking a model what to do next. The
- * routing rules here are known and cheap to evaluate, and paying a model to
- * rediscover them on every alert would be the same mistake agent/router.ts
- * exists to avoid.
+ * Unlike agent/loop.ts, the steps here are known up front: classify, gather
+ * the evidence for that class, read the runbook, decide. A graph keeps each
+ * step a small testable function and puts the round limit in the routing.
+ * Nodes call tools directly; there's no reason to pay a model to rediscover
+ * fixed rules on every alert.
  */
 import { Annotation, StateGraph, START, END } from "@langchain/langgraph";
-import { DatabaseSync } from "../db/sqlite.js";
-import { TOOLS_BY_NAME, type ToolContext } from "../tools/registry.js";
+import { TOOLS_BY_NAME } from "../tools/registry.js";
+import { openToolContext } from "../tools/context.js";
 import { redactJson } from "../guardrails/pii.js";
 
 export interface AlertInput {
@@ -52,7 +32,7 @@ const TriageState = Annotation.Root({
     default: () => "unknown",
   }),
 
-  /** Accumulates across rounds — the one channel that appends rather than replaces. */
+  /** Accumulates across rounds: the one channel that appends rather than replaces. */
   evidence: Annotation<string[]>({
     reducer: (prev, next) => prev.concat(next),
     default: () => [],
@@ -78,7 +58,7 @@ const TriageState = Annotation.Root({
     default: () => false,
   }),
 
-  /** Node names in the order they ran — the graph's own audit trail. */
+  /** Node names in the order they ran: the graph's own audit trail. */
   path: Annotation<string[]>({
     reducer: (prev, next) => prev.concat(next),
     default: () => [],
@@ -87,28 +67,21 @@ const TriageState = Annotation.Root({
 
 export type TriageResult = typeof TriageState.State;
 
-function callTool(dbPath: string, name: string, input: Record<string, unknown>): string {
+async function callTool(dbPath: string, name: string, input: Record<string, unknown>): Promise<string> {
   const tool = TOOLS_BY_NAME.get(name);
   if (!tool) return `No tool named ${name}.`;
 
-  // Mutating tools are unreachable from here by construction: triage gathers
-  // evidence and recommends, it never acts. A graph that could issue a refund
-  // would be a second door past the approval gate.
+  // Triage gathers evidence and recommends. It never acts, so mutating tools
+  // aren't reachable from here at all.
   if (tool.mutating) return `${name} is not available to triage.`;
 
-  const readDb = new DatabaseSync(dbPath, { readOnly: true });
-  const ctx: ToolContext = {
-    readDb,
-    writeDb: () => {
-      throw new Error("Triage has no write access.");
-    },
-  };
+  const ctx = openToolContext(dbPath, { writable: false });
   try {
-    return redactJson(tool.run(input, ctx)).value;
+    return redactJson(await tool.run(input, ctx)).value;
   } catch (err) {
     return `error: ${(err as Error).message}`;
   } finally {
-    readDb.close();
+    ctx.close();
   }
 }
 
@@ -127,9 +100,9 @@ const classifyNode = (state: TriageResult) => ({
   path: ["classify"],
 });
 
-const gatherPayments = (state: TriageResult) => ({
+const gatherPayments = async (state: TriageResult) => ({
   evidence: [
-    callTool(state.dbPath, "run_sql", {
+    await callTool(state.dbPath, "run_sql", {
       sql: "SELECT failure_code, COUNT(*) AS n FROM payments WHERE status = 'failed' GROUP BY failure_code ORDER BY n DESC",
     }),
   ],
@@ -137,31 +110,31 @@ const gatherPayments = (state: TriageResult) => ({
   path: ["gather:payments"],
 });
 
-const gatherLatency = (state: TriageResult) => ({
+const gatherLatency = async (state: TriageResult) => ({
   evidence: [
-    callTool(state.dbPath, "get_metric_series", {
+    await callTool(state.dbPath, "get_metric_series", {
       metric: "checkout_p95_latency_ms",
       hours: 12,
     }),
     // Latency without throughput is unreadable: the same number means "we are
     // overloaded" or "something is stuck" depending on whether traffic moved.
-    callTool(state.dbPath, "get_metric_series", { metric: "orders_per_minute", hours: 12 }),
+    await callTool(state.dbPath, "get_metric_series", { metric: "orders_per_minute", hours: 12 }),
   ],
   rounds: 1,
   path: ["gather:latency"],
 });
 
-const gatherBroad = (state: TriageResult) => ({
+const gatherBroad = async (state: TriageResult) => ({
   evidence: [
-    callTool(state.dbPath, "get_metric_series", { metric: "payment_error_rate", hours: 6 }),
-    callTool(state.dbPath, "run_sql", { sql: "SELECT COUNT(*) AS pending FROM orders WHERE status = 'pending'" }),
+    await callTool(state.dbPath, "get_metric_series", { metric: "payment_error_rate", hours: 6 }),
+    await callTool(state.dbPath, "run_sql", { sql: "SELECT COUNT(*) AS pending FROM orders WHERE status = 'pending'" }),
   ],
   rounds: 1,
   path: ["gather:broad"],
 });
 
-const consultRunbook = (state: TriageResult) => ({
-  guidance: callTool(state.dbPath, "search_runbook", {
+const consultRunbook = async (state: TriageResult) => ({
+  guidance: await callTool(state.dbPath, "search_runbook", {
     query: `${state.alert.name} ${state.alert.summary}`,
     top_k: 2,
   }),
@@ -197,7 +170,7 @@ const routeByCategory = (state: TriageResult): "payments" | "latency" | "broad" 
  * After deciding: finish, try another round, or escalate.
  *
  * The round cap lives here rather than inside a node because it is a property
- * of the workflow, not of any single step — and because a loop whose bound is
+ * of the workflow, not of any single step, and because a loop whose bound is
  * buried in the body is a loop nobody can see the shape of.
  */
 const routeAfterDecision = (state: TriageResult): "done" | "again" | "escalate" => {

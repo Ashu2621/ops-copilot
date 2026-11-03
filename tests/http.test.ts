@@ -3,7 +3,7 @@
  * webhooks, real OIDC bearer tokens, real fetch calls.
  *
  * The unit tests cover each guard in isolation; this file is the one that would
- * catch them being wired up wrongly — a route that forgets to check a scope, a
+ * catch them being wired up wrongly: a route that forgets to check a scope, a
  * webhook handler mounted behind auth, an error mapped to the wrong status.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -32,6 +32,7 @@ type PrivateKey = Awaited<ReturnType<typeof generateKeyPair>>["privateKey"];
 let server: Server;
 let base: string;
 let signKey: PrivateKey;
+let publicJwk: JWK;
 
 beforeAll(async () => {
   freshDb(DB);
@@ -41,6 +42,7 @@ beforeAll(async () => {
   const jwk = (await exportJWK(pair.publicKey)) as JWK;
   jwk.kid = "k1";
   jwk.alg = "RS256";
+  publicJwk = jwk;
 
   server = createApp({
     dbPath: DB,
@@ -61,7 +63,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   // `fetch` keeps connections alive, and `server.close()` waits for every open
-  // socket to drain — which, with idle keep-alive sockets, means waiting for
+  // socket to drain, which, with idle keep-alive sockets, means waiting for
   // their timeout. Dropping them explicitly is what makes teardown immediate
   // instead of adding minutes to the suite.
   server.closeAllConnections();
@@ -198,7 +200,7 @@ describe("authenticated routes", () => {
   });
 });
 
-describe("state change requires identity, scope, and intent", () => {
+describe("state changes go through a second person", () => {
   const refundQuestion = "Please issue a refund for order 12.";
 
   const countRefunds = () => {
@@ -208,47 +210,171 @@ describe("state change requires identity, scope, and intent", () => {
     return n;
   };
 
-  it("refuses when the caller has ops:approve but did not ask", async () => {
-    const before = countRefunds();
-    await fetch(`${base}/ask`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${await token("ops:ask ops:approve")}` },
-      body: JSON.stringify({ question: refundQuestion }),
-    });
-    expect(countRefunds()).toBe(before);
-  });
-
-  it("refuses when the caller asked but lacks ops:approve", async () => {
-    const before = countRefunds();
-    await fetch(`${base}/ask`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${await token("ops:ask")}` },
-      body: JSON.stringify({ question: refundQuestion, allow_state_change: true }),
-    });
-    expect(countRefunds()).toBe(before);
-  });
-
-  it("performs it — and records the token subject as the approver", async () => {
-    const before = countRefunds();
+  const ask = async (sub: string) => {
     const res = await fetch(`${base}/ask`, {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${await token("ops:ask ops:approve", "bilal@corp.example")}`,
-      },
-      body: JSON.stringify({ question: refundQuestion, allow_state_change: true }),
+      headers: { authorization: `Bearer ${await token("ops:ask ops:approve", sub)}` },
+      body: JSON.stringify({ question: refundQuestion }),
     });
-    expect(res.status).toBe(200);
+    return { status: res.status, body: (await res.json()) as AskBody };
+  };
+
+  const decide = async (id: string, sub: string, decision: "approve" | "reject", scope = "ops:approve") =>
+    fetch(`${base}/approvals/${id}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${await token(scope, sub)}` },
+      body: JSON.stringify({ decision }),
+    });
+
+  it("parks the refund during /ask, even for a caller holding ops:approve", async () => {
+    const before = countRefunds();
+    const { status, body } = await ask("ana@corp.example");
+
+    expect(status).toBe(202);
+    expect(body.stopped_because).toBe("awaiting_approval");
+    expect(body.pending_approvals).toHaveLength(1);
+    expect(body.pending_approvals[0]!.summary).toContain("order #12");
+    expect(countRefunds()).toBe(before);
+  });
+
+  it("won't let the requester approve their own refund", async () => {
+    const { body } = await ask("ana@corp.example");
+    const res = await decide(body.pending_approvals[0]!.id, "ana@corp.example", "approve");
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("self_approval");
+  });
+
+  it("needs ops:approve to decide", async () => {
+    const { body } = await ask("ana@corp.example");
+    const res = await decide(body.pending_approvals[0]!.id, "bilal@corp.example", "approve", "ops:ask");
+    expect(res.status).toBe(403);
+  });
+
+  it("runs the exact stored action once a second person approves, and only once", async () => {
+    const before = countRefunds();
+    const { body } = await ask("ana@corp.example");
+    const id = body.pending_approvals[0]!.id;
+
+    const first = await decide(id, "bilal@corp.example", "approve");
+    expect(first.status).toBe(200);
+    const action = (await first.json()) as { status: string; result: { approved_by: string; amount_cents: number } };
+    expect(action.status).toBe("executed");
+    expect(action.result.approved_by).toBe("bilal@corp.example");
+    expect(action.result.amount_cents).toBe(2500);
     expect(countRefunds()).toBe(before + 1);
 
+    const again = await decide(id, "carol@corp.example", "approve");
+    expect(again.status).toBe(409);
+    expect(countRefunds()).toBe(before + 1);
+  });
+
+  it("rejecting records who said no and runs nothing", async () => {
+    const before = countRefunds();
+    const { body } = await ask("ana@corp.example");
+    const res = await decide(body.pending_approvals[0]!.id, "bilal@corp.example", "reject");
+    expect(((await res.json()) as { status: string; decidedBy: string }).decidedBy).toBe("bilal@corp.example");
+    expect(countRefunds()).toBe(before);
+  });
+
+  it("lists pending approvals for approvers only", async () => {
+    await ask("ana@corp.example");
+    const denied = await fetch(`${base}/approvals`, {
+      headers: { authorization: `Bearer ${await token("ops:ask")}` },
+    });
+    expect(denied.status).toBe(403);
+
+    const res = await fetch(`${base}/approvals?status=pending`, {
+      headers: { authorization: `Bearer ${await token("ops:approve", "bilal@corp.example")}` },
+    });
+    const list = (await res.json()) as { approvals: Array<{ status: string; tool: string }> };
+    expect(list.approvals.length).toBeGreaterThan(0);
+    expect(list.approvals.every((a) => a.status === "pending" && a.tool === "issue_refund")).toBe(true);
+  });
+
+  it("logs every /ask with its subject and cost", async () => {
     const db = new DatabaseSync(DB, { readOnly: true });
     const row = db
-      .prepare("SELECT approved_by FROM refunds ORDER BY id DESC LIMIT 1")
-      .get() as { approved_by: string };
+      .prepare("SELECT subject, stopped_because FROM agent_runs WHERE subject = ? ORDER BY created_at DESC LIMIT 1")
+      .get("ana@corp.example") as { subject: string; stopped_because: string } | undefined;
     db.close();
-    // The whole point of adding OIDC: the audit trail names a person.
-    expect(row.approved_by).toBe("bilal@corp.example");
+    expect(row?.stopped_because).toBe("awaiting_approval");
   });
 });
+
+describe("hardening", () => {
+  it("rate limits /ask per subject", async () => {
+    const limited = createApp({
+      dbPath: DB,
+      provider: new MockProvider(),
+      auth: new Authenticator({
+        issuer: ISSUER,
+        audience: AUDIENCE,
+        keyStore: createLocalJWKSet({ keys: [publicJwk] }),
+      }),
+      webhookSecret: SECRET,
+      nowIso: new Date(NOW_MS).toISOString(),
+      now: () => NOW_MS,
+      askBurst: 2,
+      askPerMinute: 1,
+    });
+    await new Promise<void>((resolve) => limited.listen(0, resolve));
+    const url = `http://127.0.0.1:${(limited.address() as AddressInfo).port}/ask`;
+    const auth = `Bearer ${await token("ops:ask", "rate@corp.example")}`;
+    const hit = () =>
+      fetch(url, {
+        method: "POST",
+        headers: { authorization: auth },
+        body: JSON.stringify({ question: "How many orders are pending right now?" }),
+      });
+
+    try {
+      expect((await hit()).status).toBe(200);
+      expect((await hit()).status).toBe(200);
+      const third = await hit();
+      expect(third.status).toBe(429);
+      expect(Number(third.headers.get("retry-after"))).toBeGreaterThan(0);
+    } finally {
+      limited.closeAllConnections();
+      await new Promise<void>((resolve) => limited.close(() => resolve()));
+    }
+  });
+
+  it("returns a request id on 500s instead of the error message", async () => {
+    const lines: Array<Record<string, unknown>> = [];
+    const broken = createApp({
+      dbPath: join(process.cwd(), "data", "does-not-exist", "nope.db"),
+      provider: new MockProvider(),
+      auth: new Authenticator({
+        issuer: ISSUER,
+        audience: AUDIENCE,
+        keyStore: createLocalJWKSet({ keys: [publicJwk] }),
+      }),
+      webhookSecret: SECRET,
+      log: (l) => lines.push(l),
+    });
+    await new Promise<void>((resolve) => broken.listen(0, resolve));
+    const url = `http://127.0.0.1:${(broken.address() as AddressInfo).port}/graphql`;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { authorization: `Bearer ${await token("ops:read")}` },
+        body: JSON.stringify({ query: "{ queueStats { queued } }" }),
+      });
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).toEqual({ error: "internal_error", request_id: res.headers.get("x-request-id") });
+      expect(lines[0]?.level).toBe("error");
+    } finally {
+      broken.closeAllConnections();
+      await new Promise<void>((resolve) => broken.close(() => resolve()));
+    }
+  });
+});
+
+interface AskBody {
+  stopped_because: string;
+  pending_approvals: Array<{ id: string; summary: string }>;
+}
 
 describe("webhook -> queue -> agent, end to end", () => {
   it("triages the alert that arrived over HTTP", async () => {

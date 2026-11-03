@@ -4,7 +4,7 @@
  * Every value is derived from a fixed-seed PRNG and a fixed clock anchor, so the
  * database is byte-identical on every machine. That matters because the eval
  * harness asserts on exact numbers ("how many payments failed in the last hour?")
- * — a random seed would make those assertions flap and the scores meaningless.
+ * and a random seed would make those assertions flap and the scores meaningless.
  */
 import { DatabaseSync } from "./sqlite.js";
 import { readFileSync, mkdirSync, rmSync } from "node:fs";
@@ -17,7 +17,7 @@ export const DB_PATH = join(HERE, "..", "..", "data", "ops.db");
 /** Fixed instant the dataset is anchored to: 2026-03-14T12:00:00Z. */
 export const NOW_MS = Date.UTC(2026, 2, 14, 12, 0, 0);
 
-/** mulberry32 — small, fast, fully deterministic from a 32-bit seed. */
+/** mulberry32: small, fast, fully deterministic from a 32-bit seed. */
 function rng(seed: number): () => number {
   let a = seed >>> 0;
   return () => {

@@ -26,8 +26,8 @@ export interface ToolResultMessage {
 /**
  * The seam between the agent loop and whatever produces model turns.
  *
- * This exists so the evaluation harness and CI can run the entire agent —
- * routing, tool dispatch, guardrails, approval, telemetry — with a scripted
+ * This exists so the evaluation harness and CI can run the entire agent -
+ * routing, tool dispatch, guardrails, approval, telemetry: with a scripted
  * provider and no API key. Without the seam, "run the evals" would mean
  * "have a billing account", which puts a scored regression suite out of reach
  * of exactly the contributor most likely to need it.
@@ -42,5 +42,6 @@ export interface ModelProvider {
     tools: ToolSchema[];
     /** Conversation so far, in provider-native shape. */
     history: unknown[];
+    signal?: AbortSignal;
   }): Promise<ModelTurn>;
 }

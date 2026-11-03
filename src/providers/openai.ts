@@ -3,25 +3,12 @@ import type { ModelProvider, ModelTurn, ToolCall } from "./types.js";
 import type { ToolSchema } from "../tools/registry.js";
 
 /**
- * Second vendor behind the same `ModelProvider` seam.
+ * OpenAI behind the same ModelProvider interface.
  *
- * DESIGN NOTE — why this exists, and what it cost.
- *
- * The seam was introduced so the eval harness could run offline. This provider
- * is the test of whether it was a real abstraction or just a mock-shaped hole:
- * the agent loop, every guardrail, the router and the whole eval suite work
- * against it unchanged. It also makes the cost/latency/accuracy comparison in
- * the harness a cross-vendor one rather than a single-vendor curiosity.
- *
- * The honest cost: conversation history is stored in Anthropic's shape, because
- * Anthropic was the first provider and picking a "neutral" format on day one
- * would have been speculative. So this adapter translates on every send —
- * assistant content blocks become `tool_calls`, and each `tool_result` block
- * becomes its own `role: "tool"` message, which is the shape OpenAI expects.
- *
- * With two providers, translating in one adapter is cheaper than introducing a
- * third internal format that both must convert to. If a third vendor arrives,
- * that trade flips and the neutral shape becomes worth building.
+ * History is stored in Anthropic's message shape (it was first), so this
+ * adapter translates on every call: assistant blocks become tool_calls and
+ * each tool_result becomes its own role "tool" message. With two providers
+ * that's cheaper than a third neutral format. Revisit at three.
  */
 
 /**
@@ -70,10 +57,12 @@ export class OpenAIProvider implements ModelProvider {
     system,
     tools,
     history,
+    signal,
   }: {
     system: string;
     tools: ToolSchema[];
     history: unknown[];
+    signal?: AbortSignal;
   }): Promise<ModelTurn> {
     const response = await this.client.chat.completions.create({
       model: this.model,
@@ -83,7 +72,7 @@ export class OpenAIProvider implements ModelProvider {
         type: "function" as const,
         function: { name: t.name, description: t.description, parameters: t.input_schema },
       })),
-    });
+    }, { signal });
 
     const choice = response.choices[0];
     const message = choice?.message;

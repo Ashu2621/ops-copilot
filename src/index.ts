@@ -6,17 +6,16 @@
  *   npm run ask -- --approve "issue a refund on order 12 for 2500 cents"
  */
 import { existsSync } from "node:fs";
+import { userInfo } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { run } from "./agent/loop.js";
-import { AnthropicProvider } from "./providers/anthropic.js";
-import { MockProvider } from "./providers/mock.js";
+import { createProvider, type ProviderName } from "./providers/index.js";
 import { terminalApprover, denyAll } from "./guardrails/approval.js";
 import { DB_PATH, buildDatabase, NOW_MS } from "./db/seed.js";
-import type { ModelProvider } from "./providers/types.js";
 
 interface Args {
   question: string;
-  provider: "mock" | "anthropic";
+  provider: ProviderName;
   interactiveApproval: boolean;
   noRouter: boolean;
 }
@@ -42,18 +41,17 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   if (!args.question) {
-    console.error('Usage: npm run ask -- [--provider mock|anthropic] [--approve] "your question"');
+    console.error('Usage: npm run ask -- [--provider mock|anthropic|openai] [--approve] "your question"');
     process.exitCode = 1;
     return;
   }
 
   if (!existsSync(DB_PATH)) {
-    console.log("No database found — seeding one.");
+    console.log("No database found: seeding one.");
     buildDatabase();
   }
 
-  const provider: ModelProvider =
-    args.provider === "anthropic" ? new AnthropicProvider() : new MockProvider();
+  const provider = createProvider(args.provider);
 
   const rl = args.interactiveApproval
     ? createInterface({ input: process.stdin, output: process.stdout })
@@ -66,7 +64,7 @@ async function main(): Promise<void> {
       provider,
       useRouter: !args.noRouter,
       nowIso: new Date(NOW_MS).toISOString(),
-      approver: rl ? terminalApprover((q) => rl.question(q)) : denyAll,
+      approver: rl ? terminalApprover((q) => rl.question(q), `cli:${userInfo().username}`) : denyAll,
     });
 
     console.log(`\n${result.answer}\n`);
@@ -82,6 +80,7 @@ async function main(): Promise<void> {
     if (redacted.length > 0) {
       console.log(`  redacted     ${redacted.map(([k, v]) => `${v} ${k}`).join(", ")}`);
     }
+    for (const p of result.pendingApprovals) console.log(`  pending      ${p.summary} [${p.id}]`);
     if (result.stoppedBecause !== "answered") {
       console.log(`  stopped      ${result.stoppedBecause}`);
     }
