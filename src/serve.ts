@@ -1,40 +1,24 @@
 /**
- * Runs the HTTP surface and the queue worker in one process.
+ * HTTP API and queue worker in one process.
  *
  *   npm run serve
  *
- * Co-locating them is a deployment choice, not an architectural one: the worker
- * only shares the database with the API, so splitting them into separate
- * processes later is a config change rather than a rewrite. One process is
- * simply the right size until there is a reason for two.
+ * They only share the database, so splitting them into two deployments later
+ * is a config change.
  */
 import { existsSync } from "node:fs";
 import { createApp } from "./http/server.js";
 import { Authenticator } from "./http/auth.js";
 import { JobQueue } from "./queue/queue.js";
 import { drain } from "./queue/worker.js";
-import { MockProvider } from "./providers/mock.js";
-import { AnthropicProvider } from "./providers/anthropic.js";
-import { OpenAIProvider } from "./providers/openai.js";
+import { createProvider } from "./providers/index.js";
 import { DB_PATH, buildDatabase, NOW_MS } from "./db/seed.js";
-import type { ModelProvider } from "./providers/types.js";
-
-function providerFrom(name: string | undefined): ModelProvider {
-  switch (name) {
-    case "anthropic":
-      return new AnthropicProvider();
-    case "openai":
-      return new OpenAIProvider();
-    default:
-      return new MockProvider();
-  }
-}
 
 function required(name: string): string {
   const value = process.env[name];
   if (!value) {
     throw new Error(
-      `${name} is not set. See .env.example — the server refuses to start unsecured.`,
+      `${name} is not set. See .env.example: the server refuses to start unsecured.`,
     );
   }
   return value;
@@ -44,7 +28,10 @@ async function main(): Promise<void> {
   if (!existsSync(DB_PATH)) buildDatabase();
 
   const port = Number(process.env.PORT ?? 8080);
-  const provider = providerFrom(process.env.OPS_COPILOT_PROVIDER);
+  const provider = createProvider(process.env.OPS_COPILOT_PROVIDER);
+  // The demo database is seeded around a fixed clock, so "the last hour" only
+  // means something against that clock. Point at real data with CLOCK=wall.
+  const nowIso = process.env.OPS_COPILOT_CLOCK === "wall" ? undefined : new Date(NOW_MS).toISOString();
 
   // Fail fast rather than defaulting to an open endpoint: a webhook secret or
   // an issuer that quietly falls back to a placeholder is worse than no auth,
@@ -61,7 +48,9 @@ async function main(): Promise<void> {
     provider,
     auth,
     webhookSecret,
-    nowIso: new Date(NOW_MS).toISOString(),
+    nowIso,
+    askBurst: Number(process.env.OPS_COPILOT_ASK_BURST ?? 10),
+    askPerMinute: Number(process.env.OPS_COPILOT_ASK_PER_MINUTE ?? 30),
   });
 
   app.listen(port, () => {
@@ -71,7 +60,7 @@ async function main(): Promise<void> {
   const queue = JobQueue.open(DB_PATH);
   const tick = async () => {
     try {
-      const n = await drain({ queue, dbPath: DB_PATH, provider, nowIso: new Date(NOW_MS).toISOString() });
+      const n = await drain({ queue, dbPath: DB_PATH, provider, nowIso });
       if (n > 0) console.log(`worker: processed ${n} job(s)`);
     } catch (err) {
       // A worker that dies on one bad job stops draining the queue entirely.
@@ -82,8 +71,12 @@ async function main(): Promise<void> {
   const interval = setInterval(tick, 2_000);
   const shutdown = () => {
     clearInterval(interval);
-    queue.close();
-    app.close(() => process.exit(0));
+    // Stop taking requests, let in-flight ones finish, then close the queue.
+    app.close(() => {
+      queue.close();
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 10_000).unref();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

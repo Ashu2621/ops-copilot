@@ -1,6 +1,7 @@
-import { DatabaseSync, type DatabaseSyncInstance } from "../db/sqlite.js";
+import { createHash, randomUUID } from "node:crypto";
 import { TOOLS_BY_NAME, toolSchemas, type ToolContext } from "../tools/registry.js";
-import { redact, redactJson } from "../guardrails/pii.js";
+import { openToolContext } from "../tools/context.js";
+import { Redactor } from "../guardrails/pii.js";
 import { SqlGuardError } from "../guardrails/sql.js";
 import { denyAll, type Approver } from "../guardrails/approval.js";
 import { route } from "./router.js";
@@ -13,31 +14,47 @@ export interface RunOptions {
   provider: ModelProvider;
   approver?: Approver;
   maxSteps?: number;
-  /** Anchor for time-relative questions; defaults to the seeded dataset's clock. */
+  /** Stop calling the model once this much has been spent on one question. */
+  maxCostUsd?: number;
+  /** Per model call. */
+  modelTimeoutMs?: number;
+  /** "Now" for time-relative questions. Defaults to the wall clock; tests pass the seed's clock. */
   nowIso?: string;
-  /** Set false to force the model path even for a known intent (used by evals). */
+  /** false forces the model path even for a known intent (evals use this). */
   useRouter?: boolean;
+  runId?: string;
 }
 
 export interface StepRecord {
   tool: string;
   ok: boolean;
   approved?: boolean;
+  pendingApproval?: string;
   detail?: string;
   durationMs: number;
 }
 
+export type StopReason =
+  | "answered"
+  | "step_limit"
+  | "budget"
+  | "refusal"
+  | "no_answer"
+  | "awaiting_approval"
+  | "model_error";
+
 export interface RunResult {
+  runId: string;
   answer: string;
-  /** "router" when answered deterministically, "model" when the LLM was used. */
   path: "router" | "model";
   intent?: string;
   steps: StepRecord[];
   toolsUsed: string[];
+  pendingApprovals: Array<{ id: string; summary: string }>;
   usage: { inputTokens: number; outputTokens: number; costUsd: number };
   latencyMs: number;
   redactions: Record<string, number>;
-  stoppedBecause: "answered" | "step_limit" | "refusal" | "no_answer";
+  stoppedBecause: StopReason;
 }
 
 export async function run(options: RunOptions): Promise<RunResult> {
@@ -47,178 +64,220 @@ export async function run(options: RunOptions): Promise<RunResult> {
     dbPath,
     provider,
     approver = denyAll,
-    maxSteps = Number(process.env.OPS_COPILOT_MAX_STEPS ?? 6),
+    maxSteps = envInt("OPS_COPILOT_MAX_STEPS", 6),
+    maxCostUsd = envNumber("OPS_COPILOT_MAX_COST_USD", 0.25),
+    modelTimeoutMs = envInt("OPS_COPILOT_MODEL_TIMEOUT_MS", 60_000),
     nowIso = new Date().toISOString(),
     useRouter = true,
+    runId = randomUUID(),
   } = options;
 
-  const readDb = new DatabaseSync(dbPath, { readOnly: true });
-  let writeHandle: DatabaseSyncInstance | null = null;
+  if (!Number.isInteger(maxSteps) || maxSteps < 1) {
+    throw new RangeError(`maxSteps must be a positive integer, got ${maxSteps}`);
+  }
 
-  const ctx: ToolContext = {
-    readDb,
-    writeDb: () => {
-      writeHandle ??= new DatabaseSync(dbPath);
-      return writeHandle;
-    },
-  };
-
+  const ctx = openToolContext(dbPath, { writable: true });
+  const redactor = new Redactor();
   const steps: StepRecord[] = [];
-  const redactions: Record<string, number> = {};
+  const pending: RunResult["pendingApprovals"] = [];
   const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
 
   const finish = (
     answer: string,
     path: RunResult["path"],
-    stoppedBecause: RunResult["stoppedBecause"],
+    stoppedBecause: StopReason,
     intent?: string,
-  ): RunResult => {
-    readDb.close();
-    writeHandle?.close();
-    const safe = redact(answer);
-    mergeCounts(redactions, safe.counts);
-    return {
-      answer: safe.text,
-      path,
-      intent,
-      steps,
-      toolsUsed: steps.map((s) => s.tool),
-      usage,
-      latencyMs: Date.now() - started,
-      redactions,
-      stoppedBecause,
-    };
-  };
+  ): RunResult => ({
+    runId,
+    answer: redactor.text(answer),
+    path,
+    intent,
+    steps,
+    toolsUsed: steps.map((s) => s.tool),
+    pendingApprovals: pending,
+    usage,
+    latencyMs: Date.now() - started,
+    redactions: redactor.counts,
+    stoppedBecause,
+  });
 
-  // ── 1. Deterministic path ────────────────────────────────────────────────
-  if (useRouter) {
-    const routed = route(question, readDb, nowIso);
-    if (routed.kind === "direct") {
-      return finish(routed.answer, "router", "answered", routed.intent);
+  try {
+    if (useRouter) {
+      const routed = route(question, ctx.readDb, nowIso);
+      if (routed.kind === "direct") return finish(routed.answer, "router", "answered", routed.intent);
     }
+
+    // The question goes through the same redactor as the tool results, so a
+    // pasted email gets the same tag it would get from the customers table.
+    const history: unknown[] = [{ role: "user", content: redactor.text(question) }];
+    const seen = new Set<string>();
+
+    for (let step = 0; step < maxSteps; step++) {
+      if (usage.costUsd >= maxCostUsd) {
+        return finish(`Stopped: this question hit its $${maxCostUsd.toFixed(2)} budget.`, "model", "budget");
+      }
+
+      let turn;
+      try {
+        turn = await provider.send({
+          system: SYSTEM_PROMPT,
+          tools: toolSchemas(),
+          history,
+          signal: AbortSignal.timeout(modelTimeoutMs),
+        });
+      } catch (err) {
+        return finish(`The model call failed: ${(err as Error).message}`, "model", "model_error");
+      }
+
+      usage.inputTokens += turn.usage.inputTokens;
+      usage.outputTokens += turn.usage.outputTokens;
+      usage.costUsd += provider.priceUsd(turn.usage.inputTokens, turn.usage.outputTokens);
+
+      if (turn.stopReason === "refusal") {
+        const why = turn.refusalCategory ? ` (${turn.refusalCategory})` : "";
+        return finish(`The model declined to answer this request${why}.`, "model", "refusal");
+      }
+      if (turn.toolCalls.length === 0) {
+        return finish(turn.text || "No answer produced.", "model", turn.text ? "answered" : "no_answer");
+      }
+
+      history.push({ role: "assistant", content: turn.raw });
+
+      const results: ToolResultMessage[] = [];
+      for (const call of turn.toolCalls) {
+        results.push(await dispatch({ call, ctx, approver, runId, redactor, steps, pending, seen }));
+      }
+
+      history.push({
+        role: "user",
+        content: results.map((r) => ({
+          type: "tool_result",
+          tool_use_id: r.toolUseId,
+          content: r.content,
+          ...(r.isError ? { is_error: true } : {}),
+        })),
+      });
+
+      // Parked actions end the run here. The model doesn't get to keep going
+      // as if the refund happened, and it doesn't get to try another route.
+      if (pending.length > 0) {
+        const list = pending.map((p) => `${p.summary} [approval ${p.id}]`).join("; ");
+        return finish(`Waiting for approval: ${list}.`, "model", "awaiting_approval");
+      }
+    }
+
+    return finish(
+      "Stopped after reaching the tool-call limit without producing a final answer.",
+      "model",
+      "step_limit",
+    );
+  } finally {
+    ctx.close();
   }
-
-  // ── 2. Model path ────────────────────────────────────────────────────────
-  const history: unknown[] = [{ role: "user", content: question }];
-
-  for (let step = 0; step < maxSteps; step++) {
-    const turn = await provider.send({
-      system: SYSTEM_PROMPT,
-      tools: toolSchemas(),
-      history,
-    });
-
-    usage.inputTokens += turn.usage.inputTokens;
-    usage.outputTokens += turn.usage.outputTokens;
-    usage.costUsd += provider.priceUsd(turn.usage.inputTokens, turn.usage.outputTokens);
-
-    if (turn.stopReason === "refusal") {
-      return finish(
-        `The model declined to answer this request${turn.refusalCategory ? ` (${turn.refusalCategory})` : ""}.`,
-        "model",
-        "refusal",
-      );
-    }
-
-    if (turn.toolCalls.length === 0) {
-      return finish(turn.text || "No answer produced.", "model", turn.text ? "answered" : "no_answer");
-    }
-
-    history.push({ role: "assistant", content: turn.raw });
-
-    const results: ToolResultMessage[] = [];
-    for (const call of turn.toolCalls) {
-      results.push(await dispatch(call, ctx, approver, steps, redactions));
-    }
-
-    history.push({
-      role: "user",
-      content: results.map((r) => ({
-        type: "tool_result",
-        tool_use_id: r.toolUseId,
-        content: r.content,
-        ...(r.isError ? { is_error: true } : {}),
-      })),
-    });
-  }
-
-  return finish(
-    "Stopped after reaching the tool-call limit without producing a final answer.",
-    "model",
-    "step_limit",
-  );
 }
 
-async function dispatch(
-  call: { id: string; name: string; input: Record<string, unknown> },
-  ctx: ToolContext,
-  approver: Approver,
-  steps: StepRecord[],
-  redactions: Record<string, number>,
-): Promise<ToolResultMessage> {
+interface DispatchArgs {
+  call: { id: string; name: string; input: Record<string, unknown> };
+  ctx: ToolContext;
+  approver: Approver;
+  runId: string;
+  redactor: Redactor;
+  steps: StepRecord[];
+  pending: RunResult["pendingApprovals"];
+  seen: Set<string>;
+}
+
+async function dispatch(a: DispatchArgs): Promise<ToolResultMessage> {
+  const { call, ctx, steps } = a;
   const startedAt = Date.now();
   const tool = TOOLS_BY_NAME.get(call.name);
+  const fail = (detail: string, content: string, extra: Partial<StepRecord> = {}): ToolResultMessage => {
+    steps.push({ tool: call.name, ok: false, detail, durationMs: Date.now() - startedAt, ...extra });
+    return { toolUseId: call.id, content, isError: true };
+  };
 
-  if (!tool) {
-    steps.push({ tool: call.name, ok: false, detail: "unknown_tool", durationMs: 0 });
-    return { toolUseId: call.id, content: `No tool named ${call.name}.`, isError: true };
-  }
+  if (!tool) return fail("unknown_tool", `No tool named ${call.name}.`);
 
-  // Mutating tools never execute on the model's say-so alone.
+  let auth;
   if (tool.mutating) {
-    const decision = await approver({
-      tool: tool.name,
-      input: call.input,
-      summary: tool.summarise?.(call.input) ?? `${tool.name}(${JSON.stringify(call.input)})`,
-    });
+    // Same tool + same input twice in one run is one action, not two.
+    const fingerprint = `${tool.name}:${stableJson(call.input)}`;
+    if (a.seen.has(fingerprint)) {
+      return fail("duplicate_call", "This exact action was already requested in this run. Do not repeat it.");
+    }
+    a.seen.add(fingerprint);
 
-    if (!decision.approved) {
+    const summary = tool.summarise?.(call.input) ?? `${tool.name}(${JSON.stringify(call.input)})`;
+    const decision = await a.approver({ runId: a.runId, tool: tool.name, input: call.input, summary });
+
+    if (decision.status === "pending") {
+      a.pending.push({ id: decision.approvalId, summary });
       steps.push({
         tool: call.name,
         ok: false,
-        approved: false,
-        detail: "approval_denied",
+        pendingApproval: decision.approvalId,
+        detail: "awaiting_approval",
         durationMs: Date.now() - startedAt,
       });
       return {
         toolUseId: call.id,
-        content: `Refused: a human did not approve this action. ${decision.reason ?? ""}`.trim(),
-        isError: true,
+        content: `Queued for human approval (id ${decision.approvalId}). It has not run. Do not retry.`,
+        isError: false,
       };
     }
-    ctx.approvedBy = decision.decidedBy;
+    if (decision.status === "denied") {
+      return fail("approval_denied", `Refused: a human did not approve this action. ${decision.reason}`, {
+        approved: false,
+      });
+    }
+    auth = {
+      approvedBy: decision.decidedBy,
+      idempotencyKey: `run:${a.runId}:${sha256(fingerprint).slice(0, 16)}`,
+    };
   }
 
   try {
-    const output = tool.run(call.input, ctx);
-    const { value, counts } = redactJson(output);
-    mergeCounts(redactions, counts);
-
+    const output = await tool.run(call.input, ctx, auth);
     steps.push({
       tool: call.name,
       ok: true,
       ...(tool.mutating ? { approved: true } : {}),
       durationMs: Date.now() - startedAt,
     });
-    return { toolUseId: call.id, content: value, isError: false };
+    return { toolUseId: call.id, content: a.redactor.json(output), isError: false };
   } catch (err) {
+    // Errors go back to the model as is_error so it can fix its query.
     const message =
-      err instanceof SqlGuardError
-        ? `${err.code}: ${err.message}`
-        : ((err as Error).message ?? "tool failed");
-
-    steps.push({
-      tool: call.name,
-      ok: false,
-      detail: message,
-      durationMs: Date.now() - startedAt,
-    });
-    // Errors go back to the model as tool_result with is_error so it can
-    // correct itself within the loop rather than the run aborting.
-    return { toolUseId: call.id, content: message, isError: true };
+      err instanceof SqlGuardError ? `${err.code}: ${err.message}` : ((err as Error).message ?? "tool failed");
+    return fail(message, message);
   }
 }
 
-function mergeCounts(into: Record<string, number>, from: Record<string, number>): void {
-  for (const [k, v] of Object.entries(from)) into[k] = (into[k] ?? 0) + v;
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value).sort(([x], [y]) => x.localeCompare(y));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) throw new RangeError(`${name} must be a positive integer, got "${raw}"`);
+  return n;
+}
+
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new RangeError(`${name} must be a positive number, got "${raw}"`);
+  return n;
 }

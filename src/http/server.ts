@@ -1,22 +1,19 @@
 /**
  * HTTP surface.
  *
- *   POST /webhooks/alerts   HMAC-signed alert ingestion  -> 202, work queued
- *   POST /graphql           read API                     -> OIDC, ops:read
- *   POST /ask               ask the agent                -> OIDC, ops:ask
- *   GET  /healthz           liveness
+ *   POST /webhooks/alerts      HMAC-signed alert ingestion   -> 202, queued
+ *   POST /graphql              read API                      -> OIDC, ops:read
+ *   POST /ask                  ask the agent                 -> OIDC, ops:ask
+ *   GET  /approvals            pending state changes         -> OIDC, ops:approve
+ *   GET  /approvals/:id        one of them                   -> OIDC, ops:approve
+ *   POST /approvals/:id        approve or reject             -> OIDC, ops:approve
+ *   GET  /healthz              liveness
  *
- * Two authentication schemes on purpose, because there are two kinds of caller.
- * A monitoring system posting an alert is a machine with a shared secret and no
- * user identity, which is what HMAC is for. A person or service querying the API
- * carries an OIDC token, which is what scopes and an audit subject are for.
- * Using one mechanism for both would mean either handing alerting systems an
- * OAuth client or accepting a shared secret as proof of human identity.
- *
- * Built on node:http rather than a framework — the routing table is four
- * entries, and keeping the dependency list short is what lets a reviewer run
- * this from a clean checkout.
+ * Alerts come from machines with a shared secret, so they use HMAC. People and
+ * services carry OIDC tokens, which give us scopes and a subject for the audit
+ * trail. Plain node:http because the routing table is seven lines.
  */
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { DatabaseSync, type DatabaseSyncInstance } from "../db/sqlite.js";
 import { JobQueue } from "../queue/queue.js";
@@ -25,7 +22,9 @@ import { receiveAlert, WebhookError } from "./webhooks.js";
 import { execute } from "./graphql.js";
 import { run } from "../agent/loop.js";
 import type { ModelProvider } from "../providers/types.js";
-import type { Approver } from "../guardrails/approval.js";
+import { pendingApprover, decide, getAction, listActions, ApprovalError, type ActionStatus } from "../approvals/store.js";
+import { recordRun } from "../agent/runlog.js";
+import { RateLimiter } from "./ratelimit.js";
 
 export interface ServerOptions {
   dbPath: string;
@@ -34,28 +33,46 @@ export interface ServerOptions {
   webhookSecret: string;
   nowIso?: string;
   now?: () => number;
+  /** /ask calls per subject: burst size, then refill rate. */
+  askBurst?: number;
+  askPerMinute?: number;
+  log?: (line: Record<string, unknown>) => void;
 }
 
 const MAX_BODY_BYTES = 256 * 1024;
 
+interface Deps {
+  opts: ServerOptions;
+  now: () => number;
+  limiter: RateLimiter;
+  log: (line: Record<string, unknown>) => void;
+}
+
 export function createApp(opts: ServerOptions): Server {
   const now = opts.now ?? Date.now;
+  const deps: Deps = {
+    opts,
+    now,
+    limiter: new RateLimiter(opts.askBurst ?? 10, (opts.askPerMinute ?? 30) / 60, now),
+    log: opts.log ?? ((line) => console.error(JSON.stringify(line))),
+  };
 
   return createServer((req, res) => {
-    handle(req, res, opts, now).catch((err) => {
-      sendJson(res, 500, { error: "internal_error", message: (err as Error).message });
+    const requestId = randomUUID();
+    res.setHeader("x-request-id", requestId);
+    handle(req, res, deps).catch((err) => {
+      // Details go to the log, not the client.
+      deps.log({ level: "error", requestId, route: `${req.method} ${req.url}`, error: (err as Error).stack });
+      if (!res.headersSent) sendJson(res, 500, { error: "internal_error", request_id: requestId });
     });
   });
 }
 
-async function handle(
-  req: IncomingMessage,
-  res: ServerResponse,
-  opts: ServerOptions,
-  now: () => number,
-): Promise<void> {
+async function handle(req: IncomingMessage, res: ServerResponse, deps: Deps): Promise<void> {
+  const { opts, now } = deps;
   const url = new URL(req.url ?? "/", "http://localhost");
   const route = `${req.method} ${url.pathname}`;
+  const approvalId = /^\/approvals\/([0-9a-f-]{36})$/.exec(url.pathname)?.[1];
 
   if (route === "GET /healthz") {
     return sendJson(res, 200, { ok: true });
@@ -75,8 +92,16 @@ async function handle(
       case "POST /graphql":
         return await handleGraphql(res, opts, body, req.headers.authorization);
       case "POST /ask":
-        return await handleAsk(res, opts, body, req.headers.authorization);
+        return await handleAsk(res, deps, body, req.headers.authorization);
+      case "GET /approvals":
+        return await handleListApprovals(res, opts, url, req.headers.authorization);
       default:
+        if (approvalId && req.method === "GET") {
+          return await handleGetApproval(res, opts, approvalId, req.headers.authorization);
+        }
+        if (approvalId && req.method === "POST") {
+          return await handleDecide(res, deps, approvalId, body, req.headers.authorization);
+        }
         return sendJson(res, 404, { error: "not_found", message: `No route for ${route}.` });
     }
   } catch (err) {
@@ -85,7 +110,7 @@ async function handle(
       res.setHeader("WWW-Authenticate", `Bearer error="${err.code}"`);
       return sendJson(res, err.status, { error: err.code, message: err.message });
     }
-    if (err instanceof WebhookError) {
+    if (err instanceof WebhookError || err instanceof ApprovalError) {
       return sendJson(res, err.status, { error: err.code, message: err.message });
     }
     throw err;
@@ -143,68 +168,134 @@ async function handleGraphql(
 
 async function handleAsk(
   res: ServerResponse,
-  opts: ServerOptions,
+  deps: Deps,
   body: string,
   authorization: string | undefined,
 ): Promise<void> {
+  const { opts, now } = deps;
   const principal = await opts.auth.authenticate(authorization);
   requireScope(principal, SCOPES.ask);
 
-  let parsed: { question?: string; allow_state_change?: boolean };
+  const wait = deps.limiter.take(principal.subject);
+  if (wait > 0) {
+    res.setHeader("retry-after", String(wait));
+    return sendJson(res, 429, { error: "rate_limited", message: `Try again in ${wait}s.` });
+  }
+
+  let parsed: { question?: unknown };
   try {
     parsed = JSON.parse(body || "{}");
   } catch {
     return sendJson(res, 400, { error: "bad_json", message: "Body is not valid JSON." });
   }
-  if (!parsed.question) {
+  if (typeof parsed.question !== "string" || parsed.question.trim() === "") {
     return sendJson(res, 400, { error: "no_question", message: "Missing 'question'." });
   }
+  if (parsed.question.length > 2000) {
+    return sendJson(res, 400, { error: "question_too_long", message: "Keep questions under 2000 characters." });
+  }
 
+  const startedAt = now();
   const result = await run({
     question: parsed.question,
     dbPath: opts.dbPath,
     provider: opts.provider,
     nowIso: opts.nowIso,
-    approver: approverFor(principal, parsed.allow_state_change === true),
+    // Nothing mutates during /ask. State changes are parked for a second person.
+    approver: pendingApprover(opts.dbPath, principal.subject, now),
   });
+  recordRun(
+    opts.dbPath,
+    { subject: principal.subject, question: parsed.question, provider: opts.provider, at: startedAt },
+    result,
+  );
 
-  sendJson(res, 200, {
+  sendJson(res, result.stoppedBecause === "awaiting_approval" ? 202 : 200, {
+    run_id: result.runId,
     answer: result.answer,
     path: result.path,
     tools_used: result.toolsUsed,
+    pending_approvals: result.pendingApprovals,
     tokens: result.usage,
     latency_ms: result.latencyMs,
     stopped_because: result.stoppedBecause,
   });
 }
 
-/**
- * Turn a verified token into an approver.
- *
- * This is the join between OIDC and the human-in-the-loop gate: approval is
- * granted only when the caller both holds `ops:approve` AND asked for it
- * explicitly on this request, and the identity written to `refunds.approved_by`
- * is the token subject — not a hardcoded label. That is what makes the audit
- * trail answer "who authorised this refund?" months later.
- */
-export function approverFor(principal: Principal, requested: boolean): Approver {
-  return async () => {
-    if (!requested) {
-      return {
-        approved: false,
-        decidedBy: "not-requested",
-        reason: "Caller did not set allow_state_change.",
-      };
-    }
-    if (!principal.scopes.has(SCOPES.approve)) {
-      return {
-        approved: false,
-        decidedBy: principal.subject,
-        reason: `Subject lacks the '${SCOPES.approve}' scope.`,
-      };
-    }
-    return { approved: true, decidedBy: principal.subject };
-  };
+const ACTION_STATUSES: ActionStatus[] = ["pending", "executing", "executed", "rejected", "failed", "expired"];
+
+async function handleListApprovals(
+  res: ServerResponse,
+  opts: ServerOptions,
+  url: URL,
+  authorization: string | undefined,
+): Promise<void> {
+  const principal = await opts.auth.authenticate(authorization);
+  requireScope(principal, SCOPES.approve);
+
+  const status = (url.searchParams.get("status") ?? "pending") as ActionStatus;
+  if (!ACTION_STATUSES.includes(status)) {
+    return sendJson(res, 400, { error: "bad_status", message: `status must be one of ${ACTION_STATUSES.join(", ")}.` });
+  }
+
+  const db = new DatabaseSync(opts.dbPath, { readOnly: true });
+  try {
+    const limit = Number(url.searchParams.get("limit") ?? 50) || 50;
+    sendJson(res, 200, { approvals: listActions(db, status, limit) });
+  } finally {
+    db.close();
+  }
+}
+
+async function handleGetApproval(
+  res: ServerResponse,
+  opts: ServerOptions,
+  id: string,
+  authorization: string | undefined,
+): Promise<void> {
+  const principal = await opts.auth.authenticate(authorization);
+  requireScope(principal, SCOPES.approve);
+
+  const db = new DatabaseSync(opts.dbPath, { readOnly: true });
+  try {
+    const action = getAction(db, id);
+    if (!action) return sendJson(res, 404, { error: "not_found", message: "No such approval." });
+    sendJson(res, 200, action);
+  } finally {
+    db.close();
+  }
+}
+
+async function handleDecide(
+  res: ServerResponse,
+  deps: Deps,
+  id: string,
+  body: string,
+  authorization: string | undefined,
+): Promise<void> {
+  const principal = await deps.opts.auth.authenticate(authorization);
+  requireScope(principal, SCOPES.approve);
+
+  let parsed: { decision?: unknown; reason?: unknown };
+  try {
+    parsed = JSON.parse(body || "{}");
+  } catch {
+    return sendJson(res, 400, { error: "bad_json", message: "Body is not valid JSON." });
+  }
+  if (parsed.decision !== "approve" && parsed.decision !== "reject") {
+    return sendJson(res, 400, { error: "bad_decision", message: "decision must be 'approve' or 'reject'." });
+  }
+
+  const action = await decide({
+    dbPath: deps.opts.dbPath,
+    id,
+    decision: parsed.decision,
+    approver: principal.subject,
+    reason: typeof parsed.reason === "string" ? parsed.reason.slice(0, 500) : undefined,
+    now: deps.now,
+  });
+  deps.log({ level: "info", event: "approval_decided", id, status: action.status, by: principal.subject });
+  sendJson(res, action.status === "failed" ? 422 : 200, action);
 }
 
 function headersOf(req: IncomingMessage): Record<string, string | undefined> {

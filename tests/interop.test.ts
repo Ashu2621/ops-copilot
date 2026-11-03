@@ -15,7 +15,7 @@ const DB = join(process.cwd(), "data", "test-interop.db");
 beforeAll(() => freshDb(DB));
 afterAll(() => rmSync(DB, { force: true }));
 
-describe("OpenAI adapter — proving the provider seam is real", () => {
+describe("OpenAI adapter: proving the provider seam is real", () => {
   it("passes a plain user turn through", () => {
     expect(toOpenAIMessages([{ role: "user", content: "how many orders?" }])).toEqual([
       { role: "user", content: "how many orders?" },
@@ -81,7 +81,7 @@ describe("OpenAI adapter — proving the provider seam is real", () => {
   });
 });
 
-describe("MCP server — same registry, same guardrails", () => {
+describe("MCP server: same registry, same guardrails", () => {
   /** Reach the handlers the way the transport would, without a live socket. */
   function handlers(dbPath: string) {
     const server = buildServer(dbPath);
@@ -101,7 +101,7 @@ describe("MCP server — same registry, same guardrails", () => {
     const result = (await list()) as { tools: Array<{ name: string; inputSchema: unknown }> };
 
     expect(result.tools.map((t) => t.name).sort()).toEqual(TOOLS.map((t) => t.name).sort());
-    // Same JSON Schema object the Anthropic API receives — one definition.
+    // Same JSON Schema object the Anthropic API receives: one definition.
     expect(result.tools.find((t) => t.name === "run_sql")!.inputSchema).toBe(
       TOOLS.find((t) => t.name === "run_sql")!.input_schema,
     );
@@ -127,7 +127,7 @@ describe("MCP server — same registry, same guardrails", () => {
     expect(result.content[0]!.text).toContain("not_a_read");
   });
 
-  it("refuses the mutating tool — an MCP session has no approver", async () => {
+  it("refuses the mutating tool: an MCP session has no approver", async () => {
     const { call } = handlers(DB);
     const result = (await call("issue_refund", {
       order_id: 12,

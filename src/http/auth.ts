@@ -1,27 +1,11 @@
 /**
- * OAuth 2.0 / OIDC bearer-token authentication and scope-based authorization.
+ * OIDC bearer tokens and scopes.
  *
- * DESIGN NOTE — why this is not decoration.
- *
- * The agent has a tool that moves money. The approval gate already refuses to
- * run it without a human saying yes — but "a human said yes" is only worth
- * something if you can say *which* human, later, when someone asks why a refund
- * was issued. Before this file existed the audit trail recorded the string
- * "cli-operator", which is a label, not an identity.
- *
- * So the token subject is what gets written to `refunds.approved_by`. OIDC here
- * is the thing that makes the human-in-the-loop guarantee auditable rather than
- * merely present.
- *
- * Verification is delegated to `jose` against the issuer's published JWKS.
- * Three properties are enforced and none of them are optional:
- *   - signature, against a key fetched from the issuer (never from the token),
- *   - `iss` and `aud`, so a token minted for another service is rejected here,
- *   - `exp` / `nbf`, with a small clock tolerance.
- *
- * The algorithm is pinned. Accepting whatever `alg` the token header claims is
- * how `alg: none` and RS256-verified-as-HS256 confusion get in — the header is
- * attacker-controlled input, so it does not get a vote.
+ * The token subject is who gets recorded as the approver of a refund, so this
+ * is what makes the audit trail name a person. Verification uses jose against
+ * the issuer's JWKS: signature (key from the issuer, never from the token),
+ * iss and aud, exp/nbf with a little clock skew. The algorithm is pinned
+ * because the token header is attacker input.
  */
 import { createRemoteJWKSet, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
 

@@ -1,22 +1,10 @@
 /**
- * Deterministic-first routing.
+ * Answers the common on-call questions straight from SQL.
  *
- * DESIGN NOTE — the point of this file.
- *
- * A large share of real on-call traffic is not open-ended reasoning. It is the
- * same dozen questions asked over and over: how many payments failed, what is
- * p95 right now, how many orders are stuck pending. Those have exactly one
- * correct answer, computable by one query, and routing them through a language
- * model buys nothing while adding three costs — money per call, a second of
- * latency, and a non-zero chance the model paraphrases the number wrong.
- *
- * So known intents are matched here and answered directly from SQL. The model is
- * reserved for what it is actually good at: questions nobody anticipated, and
- * questions that need several tools composed together.
- *
- * The escalation rate this produces is reported by the eval harness, because it
- * is the number that tells you whether the routing layer is earning its keep.
- * If it ever approaches 100%, this file should be deleted rather than defended.
+ * "How many payments failed in the last hour" has one right answer and one
+ * query. Sending it to a model costs money and latency and risks a misquoted
+ * number. Anything not matched here goes to the model. The eval prints the
+ * escalation rate; if it gets close to 100%, delete this file.
  */
 import type { DatabaseSyncInstance as DatabaseSync } from "../db/sqlite.js";
 

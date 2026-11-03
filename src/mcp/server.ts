@@ -1,31 +1,18 @@
 /**
- * MCP server — exposes the copilot's tools over the Model Context Protocol.
+ * The same tools over MCP, for Claude Desktop, editors or other agents.
  *
- * DESIGN NOTE — one registry, two transports.
+ * Reads the shared TOOLS registry, so a new tool shows up here automatically
+ * with the same guardrails (read-only SQL, row cap, PII redaction).
+ * issue_refund is refused: an MCP session has nobody to approve it.
  *
- * The agent loop reaches these tools through the Anthropic tool-use API. Any
- * other MCP-speaking client — Claude Desktop, an editor, another agent — reaches
- * the same four tools through this file. Crucially it is the *same registry*:
- * `TOOLS` is the single source of truth, so a tool added there is exposed on
- * both surfaces, described identically, and cannot drift between them.
- *
- * The guardrails come along for the ride, which is the whole point. An MCP
- * client gets the read-only connection, the row cap and the PII redactor, and
- * `issue_refund` is refused here rather than executed — an external client has
- * no approver attached, and "no human is watching" is exactly when a mutating
- * tool must not run. Re-implementing the tools for MCP would have meant
- * re-implementing the guarantees, and eventually forgetting one.
- *
- * The low-level `Server` is used rather than `McpServer` because `registerTool`
- * wants Zod schemas, and these tools already carry JSON Schema that the
- * Anthropic API consumes. Translating them would create a second definition to
- * keep in sync — the exact drift this design avoids.
+ * Uses the low-level Server instead of McpServer because registerTool wants
+ * Zod schemas and the tools already have JSON Schema.
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { DatabaseSync } from "../db/sqlite.js";
-import { TOOLS, TOOLS_BY_NAME, type ToolContext } from "../tools/registry.js";
+import { TOOLS, TOOLS_BY_NAME } from "../tools/registry.js";
+import { openToolContext } from "../tools/context.js";
 import { redactJson } from "../guardrails/pii.js";
 import { SqlGuardError } from "../guardrails/sql.js";
 import { DB_PATH } from "../db/seed.js";
@@ -39,7 +26,7 @@ export function buildServer(dbPath: string = DB_PATH): Server {
     tools: TOOLS.map((t) => ({
       name: t.name,
       description: t.mutating
-        ? `${t.description}\n\nNOTE: refused over MCP — this tool changes state and no approver is attached to an MCP session.`
+        ? `${t.description}\n\nNOTE: refused over MCP: this tool changes state and no approver is attached to an MCP session.`
         : t.description,
       inputSchema: t.input_schema,
     })),
@@ -61,16 +48,9 @@ export function buildServer(dbPath: string = DB_PATH): Server {
       );
     }
 
-    const readDb = new DatabaseSync(dbPath, { readOnly: true });
-    const ctx: ToolContext = {
-      readDb,
-      writeDb: () => {
-        throw new Error("Write access is not available over MCP.");
-      },
-    };
-
+    const ctx = openToolContext(dbPath, { writable: false });
     try {
-      const output = tool.run((args ?? {}) as Record<string, unknown>, ctx);
+      const output = await tool.run((args ?? {}) as Record<string, unknown>, ctx);
       const { value } = redactJson(output);
       return { content: [{ type: "text" as const, text: value }] };
     } catch (err) {
@@ -78,7 +58,7 @@ export function buildServer(dbPath: string = DB_PATH): Server {
         err instanceof SqlGuardError ? `${err.code}: ${err.message}` : (err as Error).message;
       return errorResult(message);
     } finally {
-      readDb.close();
+      ctx.close();
     }
   });
 

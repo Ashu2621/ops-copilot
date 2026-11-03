@@ -1,68 +1,103 @@
 /**
- * PII redaction applied to every tool result before it reaches the model, and
- * again to the final answer before it reaches the caller.
+ * PII redaction for everything that crosses into a model provider.
  *
- * Redacting on the way *in* is the part that matters. The customers table holds
- * emails and phone numbers; without this, a question as ordinary as "who filed
- * the most refunds?" ships real contact details to a third-party API and into
- * that provider's logs. Redacting only the final answer would be theatre — the
- * data would already have left the building.
+ * Redaction happens on the way in (tool results, the user's question) as well
+ * as on the final answer. Redacting only the answer would be pointless since
+ * the provider has already logged the raw data by then.
  *
- * The replacement keeps a stable, non-reversible tag per distinct value, so the
- * model can still reason about identity ("the same customer appears twice")
- * without ever seeing the value itself.
+ * Two passes:
+ *   1. JSON fields whose key is known to hold PII are tagged whatever their
+ *      format. This is the reliable path for anything that came from our own
+ *      tables.
+ *   2. Free text is scanned with patterns. Patterns are a fallback and they are
+ *      written to miss rather than over-match: an ISO timestamp tagged as a
+ *      phone number breaks every time-based question the agent gets.
+ *
+ * One Redactor lives for one agent run, so a value keeps the same tag across
+ * every tool call in that run and the model can still tell customers apart.
  */
 
-/**
- * Order matters, and it is the specific-before-general kind of matters.
- *
- * The phone pattern is a loose "run of digits and separators", so it happily
- * swallows a 16-digit card number. Whichever pattern runs first wins the text,
- * so putting PHONE ahead of CARD silently mislabels every card as a phone
- * number — still redacted, but the counts lie, and a CARD-specific policy built
- * on those counts would never fire. Most specific first.
- */
-const PATTERNS: Array<{ kind: string; re: RegExp }> = [
+type Kind = "EMAIL" | "CARD" | "PHONE";
+
+const SENSITIVE_KEYS: Record<string, Kind> = {
+  email: "EMAIL",
+  phone: "PHONE",
+  card_number: "CARD",
+};
+
+// Order matters: CARD has to run before PHONE, or long digit runs get counted
+// as phones and the per-kind counts are wrong.
+const PATTERNS: Array<{ kind: Kind; re: RegExp }> = [
   { kind: "EMAIL", re: /[\w.+-]+@[\w-]+\.[\w.-]+/g },
   { kind: "CARD", re: /\b(?:\d[ -]*?){13,19}\b/g },
-  { kind: "PHONE", re: /\+?\d[\d\s().-]{7,}\d/g },
+  // Needs at least one separator between digit groups, which is what keeps
+  // "2026-09-01T10:00:00Z", decimals and bare integer amounts out of it.
+  {
+    kind: "PHONE",
+    re: /(?<![\w.:-])\+?\(?\d{1,3}\)?[ .-]?\d{2,4}[ .-]\d{3,4}(?:[ .-]\d{3,4})?(?![\w:])/g,
+  },
 ];
 
 export interface RedactionResult {
   text: string;
-  /** Count of redactions by kind, for telemetry and for the eval report. */
   counts: Record<string, number>;
 }
 
-export function redact(input: string): RedactionResult {
-  const counts: Record<string, number> = {};
-  const seen = new Map<string, string>();
-  let text = input;
+export class Redactor {
+  readonly counts: Record<string, number> = {};
+  private readonly tags = new Map<string, string>();
 
-  for (const { kind, re } of PATTERNS) {
-    text = text.replace(re, (match) => {
-      // Cards are matched loosely; skip anything that fails a Luhn check so we
-      // do not redact ordinary long integers such as ids or cent amounts.
-      if (kind === "CARD" && !passesLuhn(match)) return match;
-
-      const key = `${kind}:${match}`;
-      let tag = seen.get(key);
-      if (!tag) {
-        const n = (counts[kind] ?? 0) + 1;
-        counts[kind] = n;
-        tag = `[${kind}_${n}]`;
-        seen.set(key, tag);
-      }
-      return tag;
-    });
+  text(input: string): string {
+    let out = input;
+    for (const { kind, re } of PATTERNS) {
+      out = out.replace(re, (match) => {
+        if (kind === "CARD" && !passesLuhn(match)) return match;
+        return this.tag(kind, match);
+      });
+    }
+    return out;
   }
 
-  return { text, counts };
+  /** Redacts a tool result and serialises it for the model. */
+  json(value: unknown): string {
+    return JSON.stringify(this.walk(value));
+  }
+
+  private walk(value: unknown, key?: string): unknown {
+    if (typeof value === "string") {
+      const kind = key ? SENSITIVE_KEYS[key.toLowerCase()] : undefined;
+      return kind ? this.tag(kind, value) : this.text(value);
+    }
+    if (Array.isArray(value)) return value.map((v) => this.walk(v));
+    if (value && typeof value === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value)) out[k] = this.walk(v, k);
+      return out;
+    }
+    return value;
+  }
+
+  private tag(kind: Kind, raw: string): string {
+    const key = `${kind}:${raw.trim().toLowerCase()}`;
+    let tag = this.tags.get(key);
+    if (!tag) {
+      const n = (this.counts[kind] ?? 0) + 1;
+      this.counts[kind] = n;
+      tag = `[${kind}_${n}]`;
+      this.tags.set(key, tag);
+    }
+    return tag;
+  }
+}
+
+export function redact(input: string): RedactionResult {
+  const r = new Redactor();
+  return { text: r.text(input), counts: r.counts };
 }
 
 export function redactJson(value: unknown): { value: string; counts: Record<string, number> } {
-  const { text, counts } = redact(JSON.stringify(value));
-  return { value: text, counts };
+  const r = new Redactor();
+  return { value: r.json(value), counts: r.counts };
 }
 
 function passesLuhn(candidate: string): boolean {

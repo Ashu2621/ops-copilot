@@ -30,12 +30,15 @@ CREATE TABLE payments (
 );
 
 CREATE TABLE refunds (
-  id            INTEGER PRIMARY KEY,
-  order_id      INTEGER NOT NULL REFERENCES orders(id),
-  amount_cents  INTEGER NOT NULL,
-  reason        TEXT    NOT NULL,
-  approved_by   TEXT    NOT NULL,
-  created_at    TEXT    NOT NULL
+  id               INTEGER PRIMARY KEY,
+  order_id         INTEGER NOT NULL REFERENCES orders(id),
+  amount_cents     INTEGER NOT NULL CHECK (amount_cents > 0),
+  reason           TEXT    NOT NULL,
+  approved_by      TEXT    NOT NULL,
+  -- Set by the caller (approval id, or run id + call hash). A retried call
+  -- hits this constraint instead of paying out twice. NULL for seeded rows.
+  idempotency_key  TEXT    UNIQUE,
+  created_at       TEXT    NOT NULL
 );
 
 CREATE TABLE service_metrics (
@@ -50,6 +53,7 @@ CREATE INDEX idx_orders_created    ON orders(created_at);
 CREATE INDEX idx_payments_status   ON payments(status);
 CREATE INDEX idx_payments_created  ON payments(created_at);
 CREATE INDEX idx_metrics_name_time ON service_metrics(name, recorded_at);
+CREATE INDEX idx_refunds_order      ON refunds(order_id);
 
 -- ── Alert ingestion and background processing ────────────────────────────────
 -- Added when the webhook receiver landed. Alerts arrive over HTTP and are
@@ -88,3 +92,43 @@ CREATE TABLE jobs (
 
 CREATE INDEX idx_jobs_claimable ON jobs(status, run_after);
 CREATE INDEX idx_alerts_received ON alerts(received_at);
+
+-- State changes requested over HTTP wait here until a second person decides.
+-- `input` is the exact tool input the model asked for; approving runs that
+-- input, never a fresh model call.
+CREATE TABLE pending_actions (
+  id            TEXT PRIMARY KEY,
+  tool          TEXT NOT NULL,
+  input         TEXT NOT NULL,
+  summary       TEXT NOT NULL,
+  requested_by  TEXT NOT NULL,
+  run_id        TEXT NOT NULL,
+  status        TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'executed', 'rejected', 'failed', 'expired')),
+  decided_by    TEXT,
+  decided_at    TEXT,
+  result        TEXT,
+  error         TEXT,
+  created_at    TEXT NOT NULL,
+  expires_at    TEXT NOT NULL
+);
+
+CREATE INDEX idx_pending_status ON pending_actions(status, created_at);
+
+-- One row per /ask call: who asked, what it cost, how it ended.
+CREATE TABLE agent_runs (
+  id               TEXT PRIMARY KEY,
+  subject          TEXT NOT NULL,
+  question         TEXT NOT NULL,
+  path             TEXT NOT NULL,
+  provider         TEXT NOT NULL,
+  model            TEXT NOT NULL,
+  stopped_because  TEXT NOT NULL,
+  tools            TEXT NOT NULL,
+  input_tokens     INTEGER NOT NULL,
+  output_tokens    INTEGER NOT NULL,
+  cost_usd         REAL NOT NULL,
+  latency_ms       INTEGER NOT NULL,
+  created_at       TEXT NOT NULL
+);
+
+CREATE INDEX idx_runs_subject_time ON agent_runs(subject, created_at);

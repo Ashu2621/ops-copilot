@@ -57,10 +57,12 @@ export class AnthropicProvider implements ModelProvider {
     system,
     tools,
     history,
+    signal,
   }: {
     system: string;
     tools: Array<{ name: string; description: string; input_schema: unknown }>;
     history: unknown[];
+    signal?: AbortSignal;
   }): Promise<ModelTurn> {
     const response = await this.client.messages.create({
       model: this.model,
@@ -72,9 +74,9 @@ export class AnthropicProvider implements ModelProvider {
       ...(this.effort ? { output_config: { effort: this.effort } } : {}),
       tools: tools as Anthropic.Tool[],
       messages: history as Anthropic.MessageParam[],
-    });
+    }, { signal });
 
-    // A refusal returns HTTP 200 with no usable content — check before reading.
+    // A refusal returns HTTP 200 with no usable content: check before reading.
     if (response.stop_reason === "refusal") {
       return {
         raw: response.content,

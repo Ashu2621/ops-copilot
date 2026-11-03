@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { generateKeyPair, SignJWT, exportJWK, createLocalJWKSet, type JWK } from "jose";
 import { Authenticator, AuthError, requireScope, parseScopes, SCOPES } from "../src/http/auth.js";
-import { approverFor } from "../src/http/server.js";
 
 const ISSUER = "https://issuer.test";
 const AUDIENCE = "ops-copilot";
@@ -128,30 +127,5 @@ describe("scopes", () => {
       expect((err as AuthError).status).toBe(403);
       expect((err as AuthError).code).toBe("insufficient_scope");
     }
-  });
-});
-
-describe("approver identity — the join between OIDC and the approval gate", () => {
-  it("refuses when the caller did not ask for a state change", async () => {
-    const p = await auth.authenticate(`Bearer ${await token({ scope: "ops:ask ops:approve" })}`);
-    const decision = await approverFor(p, false)({ tool: "issue_refund", input: {}, summary: "" });
-    expect(decision.approved).toBe(false);
-  });
-
-  it("refuses when the caller asked but lacks the scope", async () => {
-    const p = await auth.authenticate(`Bearer ${await token({ scope: "ops:ask" })}`);
-    const decision = await approverFor(p, true)({ tool: "issue_refund", input: {}, summary: "" });
-    expect(decision.approved).toBe(false);
-    expect(decision.reason).toContain("ops:approve");
-  });
-
-  it("records the token subject as the approver, not a generic label", async () => {
-    const p = await auth.authenticate(
-      `Bearer ${await token({ sub: "ana@corp.example", scope: "ops:ask ops:approve" })}`,
-    );
-    const decision = await approverFor(p, true)({ tool: "issue_refund", input: {}, summary: "" });
-    expect(decision.approved).toBe(true);
-    // This value lands in refunds.approved_by — the point of the whole exercise.
-    expect(decision.decidedBy).toBe("ana@corp.example");
   });
 });

@@ -1,22 +1,10 @@
 /**
- * Retrieval over the on-call runbooks.
+ * TF-IDF search over the runbooks.
  *
- * DESIGN NOTE — why TF-IDF and not embeddings.
- *
- * The runbook corpus is three documents and roughly a dozen sections. At that
- * size a hosted embedding model buys nothing measurable: the queries that reach
- * this tool share vocabulary with the documents almost word for word
- * ("gateway_timeout", "p95 latency", "duplicate charge"), which is precisely the
- * regime where lexical scoring is strongest and dense retrieval's advantage —
- * matching paraphrase — has little to bite on.
- *
- * What it would cost is real: a second network dependency in the request path,
- * an API key required before anyone can run the tests, per-query latency and
- * spend, and a vector store to keep in sync with the markdown.
- *
- * So this stays lexical until the corpus outgrows it. The retrieval interface
- * below is deliberately narrow, so swapping in a dense index later means
- * replacing one function rather than rewriting the tool.
+ * Three documents, a dozen sections, and questions that reuse the runbooks'
+ * own words ("gateway_timeout", "p95"). Lexical scoring is strong there and
+ * embeddings would add an API key, latency and a vector store to keep in sync.
+ * searchRunbooks is the only entry point, so it's easy to replace later.
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, basename } from "node:path";
@@ -107,7 +95,7 @@ function getIndex(): Index {
   return cached;
 }
 
-/** Test hook — forces a rebuild after the corpus changes on disk. */
+/** Test hook: forces a rebuild after the corpus changes on disk. */
 export function resetIndex(): void {
   cached = null;
 }

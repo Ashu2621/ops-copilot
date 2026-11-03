@@ -1,0 +1,45 @@
+name: Live model eval
+
+# The PR suite runs on the scripted provider, which can't tell you whether a
+# real model picks the right tool. This runs the same cases against the real
+# providers every night and keeps the numbers as an artifact, so a prompt or
+# tool-description change that hurts tool choice shows up within a day.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [anthropic, openai]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run evals
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PROVIDER: ${{ matrix.provider }}
+        run: |
+          if [ "$PROVIDER" = anthropic ] && [ -z "$ANTHROPIC_API_KEY" ]; then echo "no key, skipping"; exit 0; fi
+          if [ "$PROVIDER" = openai ] && [ -z "$OPENAI_API_KEY" ]; then echo "no key, skipping"; exit 0; fi
+          npm run eval -- --provider "$PROVIDER" --json "out/eval-$PROVIDER.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-${{ matrix.provider }}
+          path: out/
+          if-no-files-found: ignore

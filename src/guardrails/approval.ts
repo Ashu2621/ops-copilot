@@ -1,63 +1,49 @@
 /**
- * Human-in-the-loop gate for tools that change state.
+ * Human approval for tools that change state.
  *
- * Read tools execute freely. Any tool declared `mutating` is *not* executed when
- * the model asks for it — the call is suspended, an approval request is handed
- * to whoever is driving the agent, and the tool only runs on an explicit yes.
+ * The agent loop calls an Approver for every mutating tool call, with the
+ * exact input the model produced. The approver sees that one action and
+ * answers for that one action. There is no "allow writes for this run" flag.
  *
- * The gate lives in the agent loop rather than inside each tool on purpose: a
- * tool that polices itself is one forgotten `if` away from not policing itself,
- * and every new tool would have to re-implement the same check correctly. Here
- * a tool is gated by virtue of its declaration, so the unsafe default is
- * impossible to reach by omission.
+ * Three outcomes:
+ *   approved  someone looked at this call and said yes (CLI prompt, evals)
+ *   denied    nobody can approve here, or they said no
+ *   pending   parked for a second person; see approvals/store.ts
  */
 
 export interface ApprovalRequest {
+  runId: string;
   tool: string;
   input: Record<string, unknown>;
-  /** Human-readable summary of the effect, shown to the approver. */
+  /** What the approver is shown. */
   summary: string;
 }
 
-export interface ApprovalDecision {
-  approved: boolean;
-  /** Who or what decided, recorded on the resulting row for audit. */
-  decidedBy: string;
-  reason?: string;
-}
+export type ApprovalDecision =
+  | { status: "approved"; decidedBy: string }
+  | { status: "denied"; decidedBy: string; reason: string }
+  | { status: "pending"; approvalId: string; reason: string };
 
 export type Approver = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
-/** Used by the eval harness and by CI, where no human is present. */
+/** Default everywhere no human is attached: evals, CI, MCP. */
 export const denyAll: Approver = async () => ({
-  approved: false,
+  status: "denied",
   decidedBy: "auto-deny",
   reason: "No approver attached; mutating tools are refused by default.",
 });
 
-/** Used only by eval cases that specifically exercise the approved path. */
-export const approveAll: Approver = async () => ({
-  approved: true,
-  decidedBy: "eval-harness",
-});
+/** Only for eval cases that test the approved path. */
+export const approveAll: Approver = async () => ({ status: "approved", decidedBy: "eval-harness" });
 
-/** Interactive approver for the CLI. */
-export function terminalApprover(
-  ask: (question: string) => Promise<string>,
-  operator = "cli-operator",
-): Approver {
+/** Asks the operator at the terminal, once per action. */
+export function terminalApprover(ask: (question: string) => Promise<string>, operator: string): Approver {
   return async (request) => {
-    const answer = (
-      await ask(`\n  APPROVAL REQUIRED\n  ${request.summary}\n  Proceed? [y/N] `)
-    )
+    const answer = (await ask(`\n  APPROVAL REQUIRED\n  ${request.summary}\n  Proceed? [y/N] `))
       .trim()
       .toLowerCase();
 
-    const approved = answer === "y" || answer === "yes";
-    return {
-      approved,
-      decidedBy: approved ? operator : "cli-operator-denied",
-      reason: approved ? undefined : "Operator declined.",
-    };
+    if (answer === "y" || answer === "yes") return { status: "approved", decidedBy: operator };
+    return { status: "denied", decidedBy: operator, reason: "Operator declined." };
   };
 }

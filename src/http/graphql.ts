@@ -1,21 +1,9 @@
 /**
- * GraphQL read API over alerts, triage jobs and the refund audit trail.
+ * Read-only GraphQL over alerts, triage jobs and the refund audit trail.
  *
- * DESIGN NOTE — read-only, and bounded on purpose.
- *
- * This is a query surface for a dashboard, not a second way to drive the agent.
- * There are no mutations: every state change in this system goes through the
- * approval gate, and exposing a `mutation issueRefund` would be a second door
- * into the one thing the whole design is built to make deliberate.
- *
- * GraphQL's characteristic failure is that the client, not the server, decides
- * how expensive a request is. Two cheap defences are applied here rather than
- * left for later: every list field caps its own `limit`, and the executor is
- * given a depth ceiling. Both are enforced server-side — a client-supplied
- * `limit: 100000` is clamped, not honoured.
- *
- * Resolvers read through the same read-only connection the agent uses, so this
- * API cannot write even if a resolver were wrong.
+ * No mutations: state changes only go through the approval flow. Clients
+ * decide how expensive a GraphQL query is, so list limits are clamped
+ * server-side and query depth is capped. Resolvers use a read-only connection.
  */
 import { buildSchema, graphql, parse, validate, specifiedRules, type GraphQLSchema } from "graphql";
 import type { DatabaseSyncInstance } from "../db/sqlite.js";

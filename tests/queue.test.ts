@@ -69,7 +69,7 @@ describe("job queue", () => {
 
     // attempt 1
     expect(q.fail(q.claim()!.id, "boom")).toBe("retrying");
-    // The retry is not immediately claimable — that is the backoff working.
+    // The retry is not immediately claimable: that is the backoff working.
     expect(q.claim()).toBeNull();
 
     clock += backoffMs(1);

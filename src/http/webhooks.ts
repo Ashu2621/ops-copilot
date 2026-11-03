@@ -3,14 +3,14 @@
  *
  * An alerting system (Alertmanager, PagerDuty, a monitoring vendor) POSTs here
  * when something fires; the alert is recorded, a triage job is enqueued, and the
- * handler returns 202 immediately. It does not run the agent inline — senders
+ * handler returns 202 immediately. It does not run the agent inline: senders
  * retry on a slow response, so triaging in the request path would turn one alert
  * into several.
  *
  * Three properties an inbound webhook has to get right, all tested:
  *
  * 1. AUTHENTICITY. The endpoint is public, so anything unsigned is attacker
- *    input. Signature is HMAC-SHA256 over `timestamp.body` — the timestamp is
+ *    input. Signature is HMAC-SHA256 over `timestamp.body`: the timestamp is
  *    inside the signed material, otherwise it can be rewritten freely, which
  *    would defeat (2).
  *
@@ -74,7 +74,7 @@ export function verifySignature(
   const expected = Buffer.from(sign(secret, timestamp, body), "utf8");
   const actual = Buffer.from(signature, "utf8");
 
-  // Length must match before timingSafeEqual, which throws on a mismatch —
+  // Length must match before timingSafeEqual, which throws on a mismatch -
   // and the length check itself must not short-circuit the comparison below.
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
     throw new WebhookError("Signature does not match.", 401, "bad_signature");
@@ -143,7 +143,7 @@ export function receiveAlert(args: {
 
   const seen = db.prepare("SELECT id FROM alerts WHERE id = ?").get(deliveryId);
   if (seen) {
-    // Redelivery. Acknowledge without queueing a second triage run — the
+    // Redelivery. Acknowledge without queueing a second triage run: the
     // sender needs a 2xx or it will keep retrying.
     return { status: 200, deliveryId, duplicate: true };
   }

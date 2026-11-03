@@ -1,25 +1,13 @@
 /**
- * Read-only enforcement for model-authored SQL.
+ * Guardrails for model-written SQL.
  *
- * DESIGN NOTE — why there are two layers, and which one is load-bearing.
+ * The real protection is that run_sql only ever gets a read-only connection
+ * (see sql-sandbox.ts). SQLite refuses a write however it's spelled, so there
+ * is no keyword denylist here to get around.
  *
- * The obvious implementation is a denylist: reject any query containing INSERT,
- * DROP, UPDATE, and so on. That is the wrong primitive to rely on, because it
- * tests the *spelling* of a query rather than its *effect*. It fails in both
- * directions: it rejects the harmless (`SELECT * FROM orders WHERE reason =
- * 'customer requested update'`) and it admits the harmful, because SQL has more
- * ways to write a mutation than a regex has patterns.
- *
- * So the load-bearing control here is the storage engine itself: the query tool
- * holds a connection opened with `readOnly: true`, and SQLite refuses the write
- * at execution time regardless of how the statement was spelled. That check
- * cannot be talked around by the model, because it is not made of text.
- *
- * `assertSingleReadStatement` below is the second layer, and it exists only for
- * ergonomics: it turns a would-be engine error into a fast, specific message the
- * agent can recover from within its loop, and it blocks multi-statement input,
- * which is the one shape where a read prefix could smuggle a second command.
- * If this function were deleted the system would still be safe — just chattier.
+ * assertSingleReadStatement is a cheap pre-check on top of that. It gives the
+ * model a clear error it can recover from, and it rejects multi-statement
+ * input. Deleting it would not make the system unsafe, just noisier.
  */
 
 export class SqlGuardError extends Error {
@@ -32,7 +20,12 @@ export class SqlGuardError extends Error {
   }
 }
 
-/** Strip string literals and comments so the shape can be inspected safely. */
+/** Hard cap on rows returned to the model, to bound tokens and cost. */
+export const MAX_ROWS = 50;
+
+/** Wall-clock budget for one model-written query. */
+export const QUERY_TIMEOUT_MS = Number(process.env.OPS_COPILOT_SQL_TIMEOUT_MS ?? 2000);
+
 function stripLiteralsAndComments(sql: string): string {
   return sql
     .replace(/'(?:[^']|'')*'/g, "''")
@@ -41,16 +34,6 @@ function stripLiteralsAndComments(sql: string): string {
     .replace(/\/\*[\s\S]*?\*\//g, " ");
 }
 
-/**
- * Reject anything that is not exactly one read statement.
- *
- * Only two properties are checked, both structural rather than lexical:
- *   1. the statement count is one,
- *   2. the statement begins with SELECT or WITH.
- *
- * Everything else — what tables it touches, whether it tries to mutate — is left
- * to the read-only connection, which is authoritative.
- */
 export function assertSingleReadStatement(sql: string): void {
   const bare = stripLiteralsAndComments(sql).trim();
 
@@ -74,8 +57,16 @@ export function assertSingleReadStatement(sql: string): void {
   }
 }
 
-/** Hard cap on rows returned to the model, to bound both tokens and cost. */
-export const MAX_ROWS = 50;
+/**
+ * Wraps the query so SQLite stops after MAX_ROWS + 1 rows. Without this,
+ * `SELECT * FROM payments, orders` materialises the whole cross join before
+ * we get a chance to truncate it. The newlines keep a trailing `--` comment
+ * from swallowing the closing paren.
+ */
+export function boundedQuery(sql: string): string {
+  const body = sql.trim().replace(/;\s*(?:--[^\n]*)?$/, "");
+  return `SELECT * FROM (\n${body}\n) LIMIT ${MAX_ROWS + 1}`;
+}
 
 export function truncateRows<T>(rows: T[]): { rows: T[]; truncated: boolean } {
   if (rows.length <= MAX_ROWS) return { rows, truncated: false };
