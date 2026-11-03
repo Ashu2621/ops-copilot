@@ -35,3 +35,23 @@ jobs:
       # build here rather than in production.
       - name: Evaluation suite
         run: npm run eval
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t ops-copilot:ci .
+      - name: Boots and reports healthy
+        run: |
+          docker run -d --name app -p 8080:8080 \
+            -e OIDC_ISSUER=https://issuer.test -e OIDC_AUDIENCE=ops-copilot \
+            -e OIDC_JWKS_URI=https://issuer.test/jwks.json -e WEBHOOK_SECRET=ci \
+            ops-copilot:ci
+          for i in $(seq 1 30); do
+            curl -fs localhost:8080/healthz && exit 0
+            sleep 1
+          done
+          docker logs app
+          exit 1
