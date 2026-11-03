@@ -2,8 +2,8 @@
  * Background worker: drains the job queue and triages alerts with the agent.
  *
  * Deliberately single-threaded and pull-based. Each tick claims at most one job,
- * so an alert storm queues up rather than fanning out into concurrent agent runs
- * — which is what you want when every run costs money and the downstream
+ * so an alert storm queues up rather than fanning out into concurrent agent runs,
+ * which is what you want when every run costs money and the downstream
  * database has finite connections. Concurrency, if it is ever needed, is more
  * workers rather than more parallelism inside one.
  */

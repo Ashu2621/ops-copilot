@@ -1,25 +1,13 @@
 /**
- * A durable work queue backed by SQLite.
+ * Durable job queue on SQLite.
  *
- * DESIGN NOTE — why a queue at all, and why not Redis.
+ * The webhook handler has to answer fast or senders retry and we triage the
+ * same alert several times, so it enqueues and returns 202. Workers claim a
+ * job by setting `locked_until`; if one dies mid-job the lease runs out and
+ * another picks it up. Failures back off and eventually dead-letter.
  *
- * The webhook receiver must answer fast. Alertmanager and every other sender
- * retries on a slow response, so triaging an alert inline — which means an
- * agent run, several tool calls and possibly a model round-trip — would turn
- * one alert into a pile of duplicates. The handler therefore records the alert,
- * enqueues a job and returns 202. Processing happens out of band.
- *
- * Redis or SQS would be the reflex, and in production they are probably right.
- * They are wrong *here* for the same reason the vector store was: they buy
- * nothing at this size and cost a service to run, which would mean `npm test`
- * no longer works on a clean checkout. SQLite gives the three properties that
- * actually matter — durability across restarts, atomic claim under concurrency,
- * and retry with backoff — and the interface below is narrow enough to swap.
- *
- * What makes this a queue rather than a to-do list is `locked_until`. A worker
- * claims a job by setting a visibility timeout; if it crashes mid-run the lease
- * simply expires and another worker picks the job up. Nothing is lost, and
- * nothing needs a cleanup daemon.
+ * Redis/SQS would be the production choice. SQLite keeps `npm test` working
+ * on a clean checkout, and the interface is small enough to swap.
  */
 import { DatabaseSync, type DatabaseSyncInstance } from "../db/sqlite.js";
 
@@ -138,7 +126,7 @@ export class JobQueue {
 
   /**
    * Record a failure. Retries with backoff until `max_attempts`, then parks the
-   * job as `dead` rather than retrying forever — a poison message that loops
+   * job as `dead` rather than retrying forever: a poison message that loops
    * indefinitely will starve every healthy job behind it.
    */
   fail(id: number, error: string): "retrying" | "dead" {

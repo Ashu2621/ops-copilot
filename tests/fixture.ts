@@ -3,7 +3,7 @@
  *
  * Seeding writes 300 orders, 300 payments and 144 metric samples, which takes
  * roughly three seconds. Doing that in a `beforeEach` across ~60 tests put the
- * suite at three minutes — slow enough that people stop running it locally,
+ * suite at three minutes: slow enough that people stop running it locally,
  * which is the point at which a test suite starts decaying.
  *
  * So the fixture is built once into a template and each test gets a byte copy

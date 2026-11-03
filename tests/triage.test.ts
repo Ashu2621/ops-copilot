@@ -52,7 +52,7 @@ describe("the graph", () => {
 
     expect(result.category).toBe("latency");
     expect(result.path).toContain("gather:latency");
-    // Latency without throughput is unreadable — the same number means
+    // Latency without throughput is unreadable: the same number means
     // "overloaded" or "stuck" depending on whether traffic moved.
     expect(result.evidence).toHaveLength(2);
   });
@@ -84,7 +84,7 @@ describe("the graph", () => {
     expect(result.evidence.length).toBeGreaterThan(0);
   });
 
-  it("bounds itself — the loop cannot run forever", async () => {
+  it("bounds itself: the loop cannot run forever", async () => {
     const result = await triage(alert(), DB);
     // The cap is enforced by the graph's routing, not by a counter inside a
     // node body that a later edit could forget to increment.

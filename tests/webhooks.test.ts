@@ -82,7 +82,7 @@ describe("signature verification", () => {
   it("rejects a replayed delivery outside the freshness window", () => {
     const ts = String(NOW - FRESHNESS_WINDOW_MS - 1_000);
     const sig = sign(SECRET, ts, ALERT);
-    // Signature is perfectly valid — freshness is what stops the replay.
+    // Signature is perfectly valid: freshness is what stops the replay.
     expect(() => verifySignature(SECRET, ts, sig, ALERT, NOW)).toThrow(/freshness/i);
   });
 
@@ -112,7 +112,7 @@ describe("alert ingestion", () => {
     expect(row).toMatchObject({ name: "PaymentErrorRateHigh", severity: "critical" });
   });
 
-  it("is idempotent under redelivery — at-least-once is the norm", () => {
+  it("is idempotent under redelivery: at-least-once is the norm", () => {
     receive(ALERT, headers(ALERT));
     const second = receive(ALERT, headers(ALERT));
 
@@ -191,7 +191,7 @@ describe("graphql read API", () => {
     expect(result.errors?.[0]?.message).toMatch(/depth/i);
   });
 
-  it("exposes no mutations — state changes have exactly one door", async () => {
+  it("exposes no mutations: state changes have exactly one door", async () => {
     const read = new DatabaseSync(DB, { readOnly: true });
     const result = await execute(read, `mutation { issueRefund(orderId: 1, amountCents: 100) }`);
     read.close();
