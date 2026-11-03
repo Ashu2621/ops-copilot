@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ops-copilot demo</title>
+<style>
+  :root { --bg:#fafaf9; --panel:#fff; --text:#1c1917; --dim:#57534e; --line:#e7e5e4; --accent:#1d4ed8; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0c0a09; --panel:#1c1917; --text:#f5f5f4; --dim:#a8a29e; --line:#292524; --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.lead { color:var(--dim); margin:0 0 20px; }
+  .who { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; font-size:13px; color:var(--dim); }
+  .who code { background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:1px 6px; }
+  .examples { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+  button { font:inherit; font-size:13px; padding:6px 10px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:var(--text); cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  form { display:flex; gap:8px; margin-bottom:20px; }
+  input { flex:1; min-width:0; font:inherit; padding:8px 10px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:var(--text); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:12px; }
+  .q { font-weight:600; margin-bottom:6px; }
+  .meta { font-size:12px; color:var(--dim); margin-top:8px; }
+  .pending { border-left:3px solid var(--warn); padding-left:10px; margin-top:10px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .row { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+  pre { white-space:pre-wrap; word-break:break-word; font-size:12px; color:var(--dim); margin:6px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ops-copilot</h1>
+  <p class="lead">An on-call agent for an orders/payments service, running on seeded demo data with a
+    scripted model. Refunds need a second person: ask for one as the requester, then approve it as the approver.</p>
+  <div class="who" id="who">Getting demo tokens…</div>
+
+  <div class="examples" id="examples"></div>
+  <form id="form">
+    <input id="q" maxlength="2000" placeholder="Ask about payments, orders, latency or refunds" required>
+    <button class="primary" type="submit">Ask</button>
+  </form>
+  <div id="log"></div>
+</main>
+<script>
+const EXAMPLES = [
+  "How many payments failed in the last hour?",
+  "Give me the failure code breakdown for failed payments.",
+  "Checkout felt slow earlier, what does the latency series show?",
+  "Should I refund a payment that failed with gateway_timeout?",
+  "Please issue a refund for order 12.",
+  "Delete all cancelled orders from the database.",
+  "Over-refund drill: refund order 3 for 1000000 cents.",
+];
+let tokens = null;
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+
+async function call(method, path, token, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
+async function loadTokens() {
+  const res = await fetch("/demo/tokens");
+  tokens = await res.json();
+  const who = $("who");
+  who.replaceChildren(
+    document.createTextNode("You are "), el("code", null, tokens.requester.subject),
+    document.createTextNode(" (asks) and "), el("code", null, tokens.approver.subject),
+    document.createTextNode(" (approves). Tokens last an hour."));
+}
+
+async function ask(question) {
+  const card = el("div", "card");
+  card.append(el("div", "q", question));
+  const answer = el("div", null, "Thinking…");
+  card.append(answer);
+  $("log").prepend(card);
+  const r = await call("POST", "/ask", tokens.requester.token, { question });
+  if (r.status >= 400) { answer.className = "bad"; answer.textContent = `${r.status}: ${r.body.message || r.body.error}`; return; }
+  answer.textContent = r.body.answer;
+  const tools = (r.body.tools_used || []).map((t) => t.name || t).join(", ") || "none";
+  card.append(el("div", "meta", `HTTP ${r.status} · path ${r.body.path} · tools ${tools} · ${r.body.latency_ms} ms · stopped: ${r.body.stopped_because}`));
+  for (const p of r.body.pending_approvals || []) card.append(pendingCard(p));
+}
+
+function pendingCard(p) {
+  const box = el("div", "pending");
+  box.append(el("div", null, `Waiting for a second person: ${p.summary}`));
+  const status = el("div", "meta", `approval ${p.id}`);
+  const row = el("div", "row");
+  const decide = async (who, decision) => {
+    const r = await call("POST", `/approvals/${p.id}`, tokens[who].token, { decision });
+    const ok = r.status < 300;
+    status.className = ok ? "meta ok" : "meta bad";
+    status.textContent = ok
+      ? `${r.body.status} by ${r.body.decidedBy}${r.body.result ? " · " + JSON.stringify(r.body.result) : ""}${r.body.error ? " · " + r.body.error : ""}`
+      : `${r.status} ${r.body.error}: ${r.body.message}`;
+    if (ok) row.remove();
+  };
+  const self = el("button", null, "Approve as the requester (should be refused)");
+  self.onclick = () => decide("requester", "approve");
+  const approve = el("button", "primary", "Approve as the approver");
+  approve.onclick = () => decide("approver", "approve");
+  const reject = el("button", null, "Reject");
+  reject.onclick = () => decide("approver", "reject");
+  row.append(self, approve, reject);
+  box.append(row, status);
+  return box;
+}
+
+for (const q of EXAMPLES) { const b = el("button", null, q); b.type = "button"; b.onclick = () => ask(q); $("examples").append(b); }
+$("form").onsubmit = (e) => { e.preventDefault(); const q = $("q").value.trim(); if (q) { $("q").value = ""; ask(q); } };
+loadTokens().catch(() => { $("who").textContent = "Could not get demo tokens."; });
+</script>
+</body>
+</html>

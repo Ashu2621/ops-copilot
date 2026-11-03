@@ -8,6 +8,7 @@
  *   GET  /approvals/:id        one of them                   -> OIDC, ops:approve
  *   POST /approvals/:id        approve or reject             -> OIDC, ops:approve
  *   GET  /healthz              liveness
+ *   GET  /, GET /demo/tokens   demo page and demo tokens     -> OPS_COPILOT_DEMO only
  *
  * Alerts come from machines with a shared secret, so they use HMAC. People and
  * services carry OIDC tokens, which give us scopes and a subject for the audit
@@ -25,6 +26,7 @@ import type { ModelProvider } from "../providers/types.js";
 import { pendingApprover, decide, getAction, listActions, ApprovalError, type ActionStatus } from "../approvals/store.js";
 import { recordRun } from "../agent/runlog.js";
 import { RateLimiter } from "./ratelimit.js";
+import { demoPage, type DemoIssuer } from "./demo.js";
 
 export interface ServerOptions {
   dbPath: string;
@@ -37,6 +39,8 @@ export interface ServerOptions {
   askBurst?: number;
   askPerMinute?: number;
   log?: (line: Record<string, unknown>) => void;
+  /** Demo mode: serves the demo page and mints demo tokens. See demo.ts. */
+  demo?: DemoIssuer;
 }
 
 const MAX_BODY_BYTES = 256 * 1024;
@@ -76,6 +80,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: Deps): Pr
 
   if (route === "GET /healthz") {
     return sendJson(res, 200, { ok: true });
+  }
+  if (opts.demo && route === "GET /") {
+    const html = demoPage();
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(html) });
+    return void res.end(html);
+  }
+  if (opts.demo && route === "GET /demo/tokens") {
+    return sendJson(res, 200, await opts.demo.tokens());
   }
 
   let body: string;
