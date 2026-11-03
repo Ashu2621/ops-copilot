@@ -6,6 +6,7 @@
  * They only share the database, so splitting them into two deployments later
  * is a config change.
  */
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createApp } from "./http/server.js";
 import { Authenticator } from "./http/auth.js";
@@ -13,6 +14,7 @@ import { JobQueue } from "./queue/queue.js";
 import { drain } from "./queue/worker.js";
 import { createProvider } from "./providers/index.js";
 import { DB_PATH, buildDatabase, NOW_MS } from "./db/seed.js";
+import { DEMO_AUDIENCE, DEMO_ISSUER, DemoIssuer } from "./http/demo.js";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -35,13 +37,25 @@ async function main(): Promise<void> {
 
   // Fail fast rather than defaulting to an open endpoint: a webhook secret or
   // an issuer that quietly falls back to a placeholder is worse than no auth,
-  // because it looks configured.
-  const auth = new Authenticator({
-    issuer: required("OIDC_ISSUER"),
-    audience: required("OIDC_AUDIENCE"),
-    jwksUri: process.env.OIDC_JWKS_URI,
-  });
-  const webhookSecret = required("WEBHOOK_SECRET");
+  // because it looks configured. Demo mode is the one exception, and it is
+  // explicit: tokens come from a key generated in this process (see demo.ts).
+  const demoMode = process.env.OPS_COPILOT_DEMO === "1";
+  const demo = demoMode ? await DemoIssuer.create() : undefined;
+  const auth = demo
+    ? new Authenticator({ issuer: DEMO_ISSUER, audience: DEMO_AUDIENCE, keyStore: demo.keyStore })
+    : new Authenticator({
+        issuer: required("OIDC_ISSUER"),
+        audience: required("OIDC_AUDIENCE"),
+        jwksUri: process.env.OIDC_JWKS_URI,
+      });
+  // In demo mode an unset secret becomes a random one nobody knows, so the
+  // webhook stays closed rather than open.
+  const webhookSecret = demoMode
+    ? (process.env.WEBHOOK_SECRET ?? randomBytes(32).toString("hex"))
+    : required("WEBHOOK_SECRET");
+  if (demoMode) {
+    console.warn("DEMO MODE: built-in token issuer, seeded demo data only. Never use with real data.");
+  }
 
   const app = createApp({
     dbPath: DB_PATH,
@@ -51,6 +65,7 @@ async function main(): Promise<void> {
     nowIso,
     askBurst: Number(process.env.OPS_COPILOT_ASK_BURST ?? 10),
     askPerMinute: Number(process.env.OPS_COPILOT_ASK_PER_MINUTE ?? 30),
+    demo,
   });
 
   app.listen(port, () => {
