@@ -5,6 +5,13 @@ webhook and get triaged in the background; people ask questions over HTTP, the
 CLI or MCP. The agent calls real tools against a real database, and anything
 that moves money waits for a second person to approve it.
 
+**Live demo:** https://ops-copilot-26od.onrender.com. Ask for a refund as the
+requester, watch your own approval get refused, then approve it as the second
+person. It runs in demo mode: a scripted model, seeded data, and a built-in
+token issuer instead of a real IdP (`OPS_COPILOT_DEMO=1`, see
+`src/http/demo.ts`). Free tier, so the first request after 15 idle minutes
+takes about a minute.
+
 ```
 $ npm run ask -- "How many payments failed in the last hour?"
 
