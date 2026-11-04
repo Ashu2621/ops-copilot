@@ -85,6 +85,18 @@ describe("demo mode", () => {
     expect(new Set([a.requester.subject, a.approver.subject, b.requester.subject, b.approver.subject]).size).toBe(4);
   });
 
+  it("names the model and limits how fast one address can mint tokens", async () => {
+    const mint = () => fetch(`${base}/demo/tokens`, { headers: { "x-forwarded-for": "203.0.113.9" } });
+    const first = await mint();
+    expect(((await first.json()) as { model: string }).model).toBe("mock/mock-scripted");
+    const statuses = [];
+    for (let i = 0; i < 5; i++) statuses.push((await mint()).status);
+    expect(statuses.slice(0, 4)).toEqual([200, 200, 200, 200]);
+    expect(statuses[4]).toBe(429);
+    // A different address has its own allowance.
+    expect((await fetch(`${base}/demo/tokens`, { headers: { "x-forwarded-for": "198.51.100.4" } })).status).toBe(200);
+  });
+
   it("still rejects tokens it did not sign", async () => {
     const { privateKey } = await generateKeyPair("RS256");
     const forged = await new SignJWT({ scope: "ops:ask" })

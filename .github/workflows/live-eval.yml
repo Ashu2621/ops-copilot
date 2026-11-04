@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        provider: [anthropic, openai]
+        provider: [anthropic, openai, gemini]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,10 +32,12 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PROVIDER: ${{ matrix.provider }}
         run: |
           if [ "$PROVIDER" = anthropic ] && [ -z "$ANTHROPIC_API_KEY" ]; then echo "no key, skipping"; exit 0; fi
           if [ "$PROVIDER" = openai ] && [ -z "$OPENAI_API_KEY" ]; then echo "no key, skipping"; exit 0; fi
+          if [ "$PROVIDER" = gemini ] && [ -z "$GEMINI_API_KEY" ]; then echo "no key, skipping"; exit 0; fi
           npm run eval -- --provider "$PROVIDER" --json "out/eval-$PROVIDER.json"
       - uses: actions/upload-artifact@v4
         if: always()

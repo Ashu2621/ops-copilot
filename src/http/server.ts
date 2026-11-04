@@ -49,6 +49,8 @@ interface Deps {
   opts: ServerOptions;
   now: () => number;
   limiter: RateLimiter;
+  /** Demo token minting per client address. */
+  mintLimiter: RateLimiter;
   log: (line: Record<string, unknown>) => void;
 }
 
@@ -58,6 +60,7 @@ export function createApp(opts: ServerOptions): Server {
     opts,
     now,
     limiter: new RateLimiter(opts.askBurst ?? 10, (opts.askPerMinute ?? 30) / 60, now),
+    mintLimiter: new RateLimiter(5, 10 / 3600, now),
     log: opts.log ?? ((line) => console.error(JSON.stringify(line))),
   };
 
@@ -87,7 +90,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: Deps): Pr
     return void res.end(html);
   }
   if (opts.demo && route === "GET /demo/tokens") {
-    return sendJson(res, 200, await opts.demo.tokens());
+    // Fresh tokens mean fresh rate-limit buckets on /ask, so minting itself is
+    // limited per address. X-Forwarded-For can be forged when nothing in front
+    // rewrites it; the daily model budget is the cap that can't be dodged.
+    const wait = deps.mintLimiter.take(clientAddress(req));
+    if (wait > 0) {
+      res.setHeader("retry-after", String(wait));
+      return sendJson(res, 429, { error: "rate_limited", message: `Too many demo sessions. Try again in ${wait}s.` });
+    }
+    return sendJson(res, 200, { ...(await opts.demo.tokens()), model: `${opts.provider.name}/${opts.provider.model}` });
   }
 
   let body: string;
@@ -346,3 +357,9 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 export type { DatabaseSyncInstance };
+
+function clientAddress(req: IncomingMessage): string {
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",")[0]?.trim();
+  return first || req.socket.remoteAddress || "unknown";
+}

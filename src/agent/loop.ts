@@ -7,6 +7,7 @@ import { denyAll, type Approver } from "../guardrails/approval.js";
 import { route } from "./router.js";
 import type { ModelProvider, ToolResultMessage } from "../providers/types.js";
 import { SYSTEM_PROMPT } from "./prompt.js";
+import { DailyBudgetExceeded } from "../providers/budget.js";
 
 export interface RunOptions {
   question: string;
@@ -126,6 +127,9 @@ export async function run(options: RunOptions): Promise<RunResult> {
           signal: AbortSignal.timeout(modelTimeoutMs),
         });
       } catch (err) {
+        if (err instanceof DailyBudgetExceeded) {
+          return finish(`Not answered: ${err.message}. Questions the router knows still work.`, "model", "budget");
+        }
         return finish(`The model call failed: ${(err as Error).message}`, "model", "model_error");
       }
 

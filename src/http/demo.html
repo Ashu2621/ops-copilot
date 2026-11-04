@@ -32,8 +32,10 @@
 <body>
 <main>
   <h1>ops-copilot</h1>
-  <p class="lead">An on-call agent for an orders/payments service, running on seeded demo data with a
-    scripted model. Refunds need a second person: ask for one as the requester, then approve it as the approver.</p>
+  <p class="lead">An on-call agent for an orders/payments service, running on seeded demo data. Ask in your
+    own words: common questions are answered straight from SQL, the rest go to the model, which picks tools,
+    writes read-only queries and cites runbooks. Refunds need a second person: ask for one as the requester,
+    then approve it as the approver.</p>
   <div class="who" id="who">Getting demo tokens…</div>
 
   <div class="examples" id="examples"></div>
@@ -52,6 +54,7 @@ const EXAMPLES = [
   "Please issue a refund for order 12.",
   "Delete all cancelled orders from the database.",
   "Over-refund drill: refund order 3 for 1000000 cents.",
+  "Which customers had more than one failed payment, and what went wrong?",
 ];
 let tokens = null;
 const $ = (id) => document.getElementById(id);
@@ -68,12 +71,14 @@ async function call(method, path, token, body) {
 
 async function loadTokens() {
   const res = await fetch("/demo/tokens");
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).message || `HTTP ${res.status}`);
   tokens = await res.json();
   const who = $("who");
   who.replaceChildren(
     document.createTextNode("You are "), el("code", null, tokens.requester.subject),
     document.createTextNode(" (asks) and "), el("code", null, tokens.approver.subject),
-    document.createTextNode(" (approves). Tokens last an hour."));
+    document.createTextNode(" (approves). Model: "), el("code", null, tokens.model || "unknown"),
+    document.createTextNode(". Tokens last an hour."));
 }
 
 async function ask(question) {
@@ -117,7 +122,7 @@ function pendingCard(p) {
 
 for (const q of EXAMPLES) { const b = el("button", null, q); b.type = "button"; b.onclick = () => ask(q); $("examples").append(b); }
 $("form").onsubmit = (e) => { e.preventDefault(); const q = $("q").value.trim(); if (q) { $("q").value = ""; ask(q); } };
-loadTokens().catch(() => { $("who").textContent = "Could not get demo tokens."; });
+loadTokens().catch((e) => { $("who").textContent = `Could not get demo tokens: ${e.message}`; });
 </script>
 </body>
 </html>

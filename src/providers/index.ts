@@ -1,9 +1,10 @@
 import { MockProvider } from "./mock.js";
 import { AnthropicProvider } from "./anthropic.js";
 import { OpenAIProvider } from "./openai.js";
+import { GeminiProvider } from "./gemini.js";
 import type { ModelProvider } from "./types.js";
 
-export const PROVIDERS = ["mock", "anthropic", "openai"] as const;
+export const PROVIDERS = ["mock", "anthropic", "openai", "gemini"] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 export function isProviderName(value: string): value is ProviderName {
@@ -18,6 +19,8 @@ export function createProvider(name: string | undefined): ModelProvider {
       return new AnthropicProvider();
     case "openai":
       return new OpenAIProvider();
+    case "gemini":
+      return new GeminiProvider();
     case "mock":
       return new MockProvider();
   }
