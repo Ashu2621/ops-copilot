@@ -41,7 +41,7 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   if (!args.question) {
-    console.error('Usage: npm run ask -- [--provider mock|anthropic|openai] [--approve] "your question"');
+    console.error('Usage: npm run ask -- [--provider mock|anthropic|openai|gemini] [--approve] "your question"');
     process.exitCode = 1;
     return;
   }

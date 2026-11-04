@@ -7,10 +7,11 @@ that moves money waits for a second person to approve it.
 
 **Live demo:** https://ops-copilot-26od.onrender.com. Ask for a refund as the
 requester, watch your own approval get refused, then approve it as the second
-person. It runs in demo mode: a scripted model, seeded data, and a built-in
-token issuer instead of a real IdP (`OPS_COPILOT_DEMO=1`, see
-`src/http/demo.ts`). Free tier, so the first request after 15 idle minutes
-takes about a minute.
+person. It runs on Gemini (`gemini-3.5-flash-lite`) over seeded data, so you can
+ask in your own words, with a built-in token issuer instead of a real IdP
+(`OPS_COPILOT_DEMO=1`, see `src/http/demo.ts`). Model calls are capped per day
+(`OPS_COPILOT_MODEL_DAILY_CALLS`); past the cap, router questions still answer.
+Free tier, so the first request after 15 idle minutes takes about a minute.
 
 ```
 $ npm run ask -- "How many payments failed in the last hour?"
@@ -41,6 +42,7 @@ With a real model:
 ```bash
 ANTHROPIC_API_KEY=... npm run ask -- --provider anthropic "why was checkout slow earlier?"
 OPENAI_API_KEY=...    npm run eval -- --provider openai --json out/eval.json
+GEMINI_API_KEY=...    npm run eval -- --provider gemini
 ```
 
 Docker:
@@ -115,7 +117,7 @@ and why, how many refunds the case created. No LLM-as-judge.
 
 The PR suite uses a scripted provider. That makes it free and deterministic
 but it can't score tool choice, so `.github/workflows/live-eval.yml` runs the
-same cases against Anthropic and OpenAI nightly and uploads the JSON report.
+same cases against Anthropic, OpenAI and Gemini nightly and uploads the JSON report.
 
 The `drill-*` cases script a model that misbehaves (follows an injected
 instruction, over-refunds, repeats a refund, refunds a cancelled order) and
@@ -136,7 +138,7 @@ src/
   queue/                  SQLite job queue with leases, backoff, dead-letter
   triage/graph.ts         LangGraph state machine for alert triage
   rag/retrieve.ts         TF-IDF over the runbooks
-  providers/              anthropic, openai, scripted mock
+  providers/              anthropic, openai, gemini, scripted mock, daily budget
   mcp/server.ts           tools over MCP
 evals/                    cases, graders, runner
 ```

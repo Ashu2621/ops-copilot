@@ -13,6 +13,7 @@ import { Authenticator } from "./http/auth.js";
 import { JobQueue } from "./queue/queue.js";
 import { drain } from "./queue/worker.js";
 import { createProvider } from "./providers/index.js";
+import { BudgetedProvider } from "./providers/budget.js";
 import { DB_PATH, buildDatabase, NOW_MS } from "./db/seed.js";
 import { DEMO_AUDIENCE, DEMO_ISSUER, DemoIssuer } from "./http/demo.js";
 
@@ -30,7 +31,11 @@ async function main(): Promise<void> {
   if (!existsSync(DB_PATH)) buildDatabase();
 
   const port = Number(process.env.PORT ?? 8080);
-  const provider = createProvider(process.env.OPS_COPILOT_PROVIDER);
+  // A daily cap on model calls across all callers. Unset or 0 means no cap;
+  // set it on anything public, where tokens are free to get.
+  const dailyCalls = Number(process.env.OPS_COPILOT_MODEL_DAILY_CALLS ?? 0);
+  const baseProvider = createProvider(process.env.OPS_COPILOT_PROVIDER);
+  const provider = dailyCalls > 0 ? new BudgetedProvider(baseProvider, dailyCalls) : baseProvider;
   // The demo database is seeded around a fixed clock, so "the last hour" only
   // means something against that clock. Point at real data with CLOCK=wall.
   const nowIso = process.env.OPS_COPILOT_CLOCK === "wall" ? undefined : new Date(NOW_MS).toISOString();
@@ -69,7 +74,8 @@ async function main(): Promise<void> {
   });
 
   app.listen(port, () => {
-    console.log(`ops-copilot listening on :${port} (provider: ${provider.name})`);
+    const cap = dailyCalls > 0 ? `, ${dailyCalls} model calls/day` : "";
+    console.log(`ops-copilot listening on :${port} (provider: ${provider.name}/${provider.model}${cap})`);
   });
 
   const queue = JobQueue.open(DB_PATH);

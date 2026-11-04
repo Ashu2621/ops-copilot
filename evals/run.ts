@@ -172,7 +172,7 @@ function report(outcomes: Outcome[], provider: ModelProvider) {
   if (provider.name === "mock") {
     console.log(
       "  The scripted provider fixes the tool plan, so this run scores guardrails,\n" +
-        "  routing and plumbing, not tool choice. Use --provider anthropic|openai for that.\n",
+        "  routing and plumbing, not tool choice. Use --provider anthropic|openai|gemini for that.\n",
     );
   }
 
