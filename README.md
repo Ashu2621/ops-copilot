@@ -30,7 +30,7 @@ Node 22.5+ (uses the built-in `node:sqlite`). No database server, no API key.
 ```bash
 npm install
 npm run seed        # deterministic demo database
-npm test            # 138 tests
+npm test            # 152 tests
 npm run eval        # 16 scored end-to-end cases
 npm run ask -- "which customers placed the most orders?"
 npm run serve       # HTTP API + background worker
